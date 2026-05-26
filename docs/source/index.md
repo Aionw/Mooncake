@@ -65,9 +65,16 @@ This repository also hosts its technical report and the open-sourced traces.
 :caption: Getting Started
 :maxdepth: 2
 
-getting_started/build
 getting_started/quick-start
-getting_started/supported-protocols
+getting_started/build
+
+:::
+
+% Commn usecases for Mooncake
+:::{toctree}
+:caption: Usecases
+:maxdepth: 2
+
 getting_started/observability
 getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
@@ -115,6 +122,7 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
+getting_started/supported-protocols
 design/hicache-design
 design/engram
 design/tent/overview
