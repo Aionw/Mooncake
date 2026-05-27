@@ -18,13 +18,20 @@ pip install mooncake-transfer-engine-non-cuda
 ```
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
->
-> **Note on supported protocols**: The pre-built PyPI wheels only bundle **RDMA** and **TCP** transports. Other transports such as NVMe-oF, CXL, NVLink, AWS EFA, and Ascend/NPU are not included and require [building from source](build.md).
+
+
+```{admonition} CUDA Version & Supported Protocols
+:class: note
+The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
+
+The pre-built PyPI wheels only bundle **RDMA** and **TCP** transports. Other transports such as NVMe-oF, CXL, NVLink, AWS EFA, and Ascend/NPU are not included and require [building from source](build.md).
+```
 
 ## Transfer Engine Quick Start
 
-> **Note**: When using RDMA protocol, you may need to run with `sudo` for proper permissions.
+```{admonition} RDMA
+When using RDMA protocol, you may need to run with `sudo` for proper permissions.
+```
 
 ### Start Transfer Engine Receiver (Server)
 

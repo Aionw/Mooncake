@@ -104,10 +104,12 @@ design/mooncake-store
 design/tent/overview
 design/transfer-engine/index
 design/conductor/conductor-architecture-design
+design/unified-parallel-tensor-io
 design/p2p-store
 design/hicache-design
 design/engram
 design/tent/tebench
+getting_started/observability
 :::
 
 % API Documentation
@@ -138,4 +140,16 @@ troubleshooting/troubleshooting
 :maxdepth: 1
 
 community/governance
+:::
+
+% Archived content
+
+:::{toctree}
+:caption: Archived
+:maxdepth: 1
+
+getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
+getting_started/examples/vllm-integration/vllm-integration-v0.2
+getting_started/examples/vllm-integration/vllm-integration-v0.3
+getting_started/examples/vllm-integration/vllm-integration-v1.0
 :::

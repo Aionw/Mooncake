@@ -43,22 +43,9 @@ kv-cache-storage
 
 ---
 
-## Legacy Archives
+## Archived Documentation
 
-```{admonition} Archived Pages
-:class: warning
-The following pages are **archived** and no longer maintained. All content has been consolidated into the scenario-based guides above.
-```
-
-:::{toctree}
-:maxdepth: 1
-:hidden:
-
-vllm-mooncakestoreconnector
-vllm-integration-v0.2
-vllm-integration-v0.3
-vllm-integration-v1.0
-:::
+The following pages are from earlier versions of the integration and are no longer maintained. All content has been consolidated into the scenario-based guides above.
 
 - [MooncakeStoreConnector (Original)](vllm-mooncakestoreconnector)
 - [vLLM V0 PD Disaggregation Demo (Original)](vllm-integration-v0.2)
