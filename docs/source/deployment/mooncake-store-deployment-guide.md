@@ -1,4 +1,4 @@
-# Mooncake Store Deploymen
+# Mooncake Store Deployment
 
 This guide covers the architecture, minimal deployment, and operational tuning of Mooncake Store.
 
