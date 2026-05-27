@@ -400,16 +400,6 @@ Flags for controlling data movement between DRAM and SSD.
 
 Start with `--enable_offload=true` to move cold data to SSD automatically. Add `--promotion_on_hit=true` to re-promote hot SSD data back to DRAM on access.
 
-### NoF (NVMe over Fabric)
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--nof_eviction_ratio` | `0.05` | Fraction to evict when NoF SSD hits high watermark |
-| `--nof_eviction_high_watermark_ratio` | `0.95` | Usage ratio triggering NoF SSD eviction |
-| `--nof_heartbeat_interval_sec` | `10` | NoF segment heartbeat interval |
-| `--nof_heartbeat_probe_timeout_ms` | `1000` | NoF heartbeat probe timeout |
-| `--nof_heartbeat_failures_threshold` | `3` | Consecutive heartbeat failures before unmounting NoF |
-
 ### CXL Memory
 
 | Flag | Default | Description |
