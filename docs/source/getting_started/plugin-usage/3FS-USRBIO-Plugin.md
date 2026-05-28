@@ -1,7 +1,8 @@
 # Mooncake HF3FS Plugin (Experimental)
 
-```{warning}
-**Experimental / incomplete.** The HF3FS (3FS USRBIO) integration is under development and is not yet considered production-ready. Behavior, build flags, and configuration may change without notice. Use only for evaluation and testing.
+```{admonition} Experimental Feature
+:class: warning
+The HF3FS (3FS USRBIO) integration is under development and is not yet considered production-ready. Behavior, build flags, and configuration may change without notice. Use only for evaluation and testing.
 ```
 
 This plugin implements 3FS native API (USRBIO) as a high-performance storage backend for Mooncake.
