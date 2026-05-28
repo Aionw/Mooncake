@@ -1,5 +1,10 @@
 # vLLM V0 Disaggregated Serving with MooncakeStore
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [KV Cache Storage & Sharing](kv-cache-storage) guide (see the V0 Legacy section). Please use that guide for up-to-date information.
+```
+
 ## Overview
 This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated serving scenario. Benchmark results will be released soon.
 

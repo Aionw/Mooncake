@@ -1,5 +1,10 @@
 # Guide: vLLM MooncakeStoreConnector
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [KV Cache Storage & Sharing](kv-cache-storage) guide (see the V1 Recommended section). Please use that guide for up-to-date information.
+```
+
 ## Overview
 
 This document describes how to deploy vLLM's `MooncakeStoreConnector`. `MooncakeStoreConnector`  is a new vLLM's KV connector that uses `MooncakeDistributedStore` as a shared KV cache pool. It enables:
