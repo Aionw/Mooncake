@@ -2,24 +2,6 @@
 
 This document describes how to build Mooncake.
 
-## PyPI Package
-Install the Mooncake Transfer Engine package from PyPI, which includes both Mooncake Transfer Engine and Mooncake Store Python bindings:
-
-**For CUDA-enabled systems:**
-```bash
-pip install mooncake-transfer-engine
-```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
-
-**For non-CUDA systems:**
-```bash
-pip install mooncake-transfer-engine-non-cuda
-```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
-
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
-> **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
-
 ## Automatic Build
 
 ### Recommended Version
@@ -105,6 +87,7 @@ pip install mooncake-transfer-engine-non-cuda
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
+
     ```{admonition} GPU-Direct RDMA
     :class: note
     Mooncake could use the DMA-BUF path for GPU-Direct RDMA, which does **not** require the `nvidia-peermem` kernel module. If you prefer the DMA-BUF path, please set the runtime environment variable `WITH_NVIDIA_PEERMEM=0` before starting Mooncake. If you prefer the legacy `ibv_reg_mr` path (which requires `nvidia-peermem`), set the runtime environment variable `WITH_NVIDIA_PEERMEM=1`. See Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for instructions on installing `nvidia-peermem`.
@@ -222,40 +205,66 @@ Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages
 
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
-- `-DUSE_CUDA=[ON|OFF]`: Enable GPU memory support (GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport). **Default: OFF.** Required when transferring GPU memory (e.g., KV cache in vLLM disaggregated serving), even when using TCP protocol.
-- `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on (not used when building with `-DUSE_MUSA=ON`, `-DUSE_HIP=ON`, or `-DUSE_MACA=ON`).
-- `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
-- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA.
-- `-DMACA_ROOT=/path/to/maca`: Override the MACA SDK root (`MACA_HOME` env var is also honored; default `/opt/maca`).
-- `-DMACA_INCLUDE_DIR=/path/to/include`: Override MACA include directory when `-DUSE_MACA=ON`.
-- `-DMACA_LIB_DIR=/path/to/lib64`: Override MACA library directory when `-DUSE_MACA=ON`.
-- `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: Override MACA runtime libraries linked by `transfer_engine`.
-- `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
-- `-DUSE_HYGON=[ON|OFF]`: Enable Hygon DCU support via DTK SDK. **Default: OFF.** Uses CUDA-compatible runtime.
-- `-DDTK_ROOT=/path/to/dtk`: Override the default DTK SDK root used when `-DUSE_HYGON=ON`. If unset, Mooncake uses `DTK_HOME` or `/opt/dtk`.
-- `-DDTK_INCLUDE_DIR=/path/to/include`: Override the DTK include directory when `-DUSE_HYGON=ON`.
-- `-DDTK_LIB_DIR=/path/to/lib64`: Override the DTK library directory when `-DUSE_HYGON=ON`.
-- `-DUSE_COREX=[ON|OFF]`: Enable Iluvatar CoreX GPU support. **Default: OFF.** Uses CUDA-compatible runtime.
-- `-DCOREX_ROOT=/path/to/corex`: Override the default CoreX SDK root used when `-DUSE_COREX=ON`. If unset, Mooncake uses `COREX_HOME` or `/usr/local/corex`.
-- `-DCOREX_INCLUDE_DIR=/path/to/include`: Override the CoreX include directory when `-DUSE_COREX=ON`.
-- `-DCOREX_LIB_DIR=/path/to/lib`: Override the CoreX library directory when `-DUSE_COREX=ON`.
-- `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
-- `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.
-- `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.
-- `-DMLU_LIB_DIR=/path/to/lib64`: Override the Neuware library directory when `-DUSE_MLU=ON`.
-- `-DUSE_EFA=[ON|OFF]`: Enable AWS Elastic Fabric Adapter transport via libfabric. **Default: OFF.** See [EFA Transport](../design/transfer-engine/efa_transport.md) for details.
-- `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
-- `-DUSE_CXL=[ON|OFF]`: Enable CXL support
-- `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
-- `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+
-- `-DWITH_RUST_EXAMPLE=[ON|OFF]`: Build the Transfer Engine Rust interface and sample code. **Default: OFF.**
-- `-DWITH_STORE_RUST=[ON|OFF]`: Build Mooncake Store Rust bindings and CMake Rust targets. **Default: ON.**
-- `-DWITH_EP=[ON|OFF]`: Build the EP (Expert Parallelism) and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` (semicolon-separated) to build for specific PyTorch versions, or leave empty to use the currently-installed torch. The CUDA version is detected automatically. **Default: OFF.**
-- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service for the Transfer Engine, require hiredis
-- `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
-- `-DUSE_ETCD=[ON|OFF]`: Enable etcd-based metadata service, require go 1.23+
-- `-DSTORE_USE_ETCD=[ON|OFF]`: Enable etcd-based failover for Mooncake Store, require go 1.23+. **Note:** `-DUSE_ETCD` and `-DSTORE_USE_ETCD` are two independent options. Enabling `-DSTORE_USE_ETCD` does **not** depend on `-DUSE_ETCD`
-- `-DSTORE_USE_REDIS=[ON|OFF]`: Enable Redis-based failover for Mooncake Store, require hiredis. **Default: OFF.** **Note:** `-DUSE_REDIS` and `-DSTORE_USE_REDIS` are two independent options. Enabling `-DSTORE_USE_REDIS` does **not** depend on `-DUSE_REDIS`.
-- `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
-- `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
-- `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
+
+### Build Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `BUILD_SHARED_LIBS` | OFF | Build Transfer Engine as shared library |
+| `BUILD_UNIT_TESTS` | ON | Build unit tests |
+| `BUILD_EXAMPLES` | ON | Build examples |
+
+### Component Build
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WITH_STORE` | ON | Build Mooncake Store component |
+| `WITH_P2P_STORE` | OFF | Build P2P Store component, requires go 1.23+ |
+| `WITH_EP` | OFF | Build EP (Expert Parallelism) and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `EP_TORCH_VERSIONS="2.9.1"` (semicolon-separated) to build for specific PyTorch versions, or leave empty to use the currently-installed torch |
+| `WITH_RUST_EXAMPLE` | OFF | Build the Transfer Engine Rust interface and sample code |
+| `WITH_STORE_RUST` | ON | Build Mooncake Store Rust bindings |
+
+### GPU Backend Support
+
+| GPU | Option | Default | Description |
+|-----|--------|---------|-------------|
+| NVIDIA | `USE_CUDA` | OFF | GPU memory support (GPUDirect RDMA, NVMe-oF, GPU-aware TCP). Required when transferring GPU memory even with TCP protocol |
+| AMD | `USE_HIP` | OFF | GPU support via HIP/ROCm |
+| Moore Threads | `USE_MUSA` | OFF | GPU support via MUSA |
+| MetaX (Muxi) | `USE_MACA` | OFF | GPU support via MACA |
+| | `MACA_ROOT` | `/opt/maca` | MACA SDK root path |
+| | `MACA_INCLUDE_DIR` | — | MACA include directory |
+| | `MACA_LIB_DIR` | — | MACA library directory |
+| | `MACA_RUNTIME_LIBS` | `mcruntime;mxc-runtime64;rt` | MACA runtime libraries linked by `transfer_engine` |
+| Hygon DCU | `USE_HYGON` | OFF | GPU support via DTK SDK (CUDA-compatible runtime) |
+| | `DTK_ROOT` | `/opt/dtk` | DTK SDK root path |
+| | `DTK_INCLUDE_DIR` | — | DTK include directory |
+| | `DTK_LIB_DIR` | — | DTK library directory |
+| Iluvatar CoreX | `USE_COREX` | OFF | GPU support via CoreX (CUDA-compatible runtime) |
+| | `COREX_ROOT` | `/usr/local/corex` | CoreX SDK root path |
+| | `COREX_INCLUDE_DIR` | — | CoreX include directory |
+| | `COREX_LIB_DIR` | — | CoreX library directory |
+| Cambricon MLU | `USE_MLU` | OFF | MLU memory support (memory detection, topology discovery, RDMA registration) |
+| | `NEUWARE_ROOT` | `/usr/local/neuware` | Neuware SDK root path |
+| | `MLU_INCLUDE_DIR` | — | Neuware include directory |
+| | `MLU_LIB_DIR` | — | Neuware library directory |
+
+### Transport Protocols
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `USE_MNNVL` | OFF | Multi-Node NVLink transport. Requires `USE_CUDA=ON` unless using MUSA/HIP/MACA |
+| `USE_INTRA_NVLINK` | OFF | Intra-Node NVLink transport |
+| `USE_EFA` | OFF | AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md) |
+| `USE_CXL` | OFF | CXL transport |
+
+### Metadata Services
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `USE_HTTP` | OFF | HTTP-based metadata service for Transfer Engine |
+| `USE_ETCD` | OFF | etcd-based metadata service for Transfer Engine, requires go 1.23+ |
+| `USE_REDIS` | OFF | Redis-based metadata service for Transfer Engine, requires hiredis |
+| `STORE_USE_ETCD` | OFF | etcd-based failover for Mooncake Store, requires go 1.23+. Independent from `USE_ETCD` |
+| `STORE_USE_REDIS` | OFF | Redis-based failover for Mooncake Store, requires hiredis. Independent from `USE_REDIS` |
+

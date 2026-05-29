@@ -65,67 +65,51 @@ This repository also hosts its technical report and the open-sourced traces.
 :caption: Getting Started
 :maxdepth: 2
 
-getting_started/build
 getting_started/quick-start
-getting_started/supported-protocols
-getting_started/observability
-getting_started/plugin-usage/3FS-USRBIO-Plugin
-getting_started/examples/lmcache-integration
-getting_started/examples/lmdeploy-integration-v0.9
-getting_started/examples/sglang-integration-v1
+getting_started/build
+
+:::
+
+% Simple deployment guide cover most cases
+:::{toctree}
+:caption: Deployment Guide
+:maxdepth: 2
+
+deployment/mooncake-store-deployment-guide
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
+getting_started/examples/lmcache-integration
+getting_started/examples/lmdeploy-integration-v0.9
 :::
 
 % Making the most out of Mooncake
 
 :::{toctree}
 :caption: Performance
-:maxdepth: 1
+:maxdepth: 2
 
 performance/vllm/index
 performance/sglang/index
 performance/mooncake-store/index
-performance/sglang-benchmark-results-v1
-performance/vllm-benchmark-results-v0.2
-performance/vllm-benchmark-results-v1
-performance/sglang-hicache-benchmark-results-v1
-performance/vllm-v1-support-benchmark
-performance/allocator-benchmark-result
-performance/allocation-strategy-benchmark-result
-performance/ssd-offload-benchmark-results
-performance/storage-benchmark
-:::
-
-% API Documentation
-
-:::{toctree}
-:caption: Python API Reference
-:maxdepth: 1
-
-python-api-reference/mooncake-store
-python-api-reference/transfer-engine
-http-api-reference/http-service
-python-api-reference/ep-backend
 :::
 
 % Explanation of Mooncake internals
 
 :::{toctree}
-:caption: Design Documents
+:caption: Developer Guide
 :maxdepth: 2
 
 design/architecture
 design/mooncake-store
-design/p2p-store
+design/tent/overview
 design/transfer-engine/index
+design/conductor/conductor-architecture-design
+design/unified-parallel-tensor-io
+design/p2p-store
 design/hicache-design
 design/engram
-design/unified-parallel-tensor-io
-design/tent/overview
 design/tent/tebench
-design/conductor/conductor-architecture-design
-design/conductor/indexer-api-design
+getting_started/observability
 :::
 
 % API Documentation
@@ -149,15 +133,6 @@ troubleshooting/error-code
 troubleshooting/troubleshooting
 :::
 
-% Deployment docs
-
-:::{toctree}
-:caption: Deployment
-:maxdepth: 2
-
-deployment/mooncake-store-deployment-guide
-:::
-
 % Community
 
 :::{toctree}
@@ -177,5 +152,4 @@ getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
 getting_started/examples/vllm-integration/vllm-integration-v0.2
 getting_started/examples/vllm-integration/vllm-integration-v0.3
 getting_started/examples/vllm-integration/vllm-integration-v1.0
-getting_started/examples/vllm-integration/vllmv1-lmcache-integration
 :::
