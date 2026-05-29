@@ -84,6 +84,7 @@ getting_started/examples/vllm-integration/index
 :maxdepth: 1
 
 performance/vllm/index
+performance/sglang/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
