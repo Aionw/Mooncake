@@ -167,36 +167,6 @@ Clients must also set `MC_RPC_PROTOCOL=rdma` and pass valid `rdma_devices` to th
 
 ---
 
-### High-Availability (etcd) — Production HA
-
-Runs a cluster of master instances coordinated through etcd. If the leader fails, the remaining instances elect a new leader automatically.
-
-```bash
-# Start each master instance with:
-mooncake_master \
-  --enable-ha=true \
-  --etcd-endpoints="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
-  --rpc-address=10.0.0.1
-```
-
-Each instance must specify its own reachable `--rpc-address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
-
----
-
-### High-Availability (Redis) — Alternative HA Backend
-
-Same HA semantics but using Redis instead of etcd for leader election:
-
-```bash
-mooncake_master \
-  --enable-ha=true \
-  --ha_backend_type=redis \
-  --ha_backend_connstring="redis://127.0.0.1:6379" \
-  --rpc-address=10.0.0.1
-```
-
----
-
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
 Extends the cache pool from DRAM to SSD. New objects land in DRAM; cold data is moved to SSD at eviction time; frequently re-accessed objects are promoted back to DRAM.
@@ -210,20 +180,6 @@ mooncake_master \
   --root_fs_dir=/mnt/ssd_cache \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
-```
-
----
-
-### CXL-Aware Allocation — Memory Tiering
-
-When the host has CXL-attached memory, the master can preferentially allocate new objects on the CXL tier, reserving local DRAM for latency-sensitive operations.
-
-```bash
-mooncake_master \
-  --enable_cxl=true \
-  --cxl_path=/dev/dax0.0 \
-  --cxl_size=17179869184 \
-  --allocation_strategy=cxl
 ```
 
 ---
