@@ -461,10 +461,11 @@ rpc_port: 50051
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MC_MS_AUTO_DISC` | `1` | Auto-discover NIC/GPU topology. Set `0` to provide `rdma_devices` manually |
-| `MC_MS_FILTERS` | empty | Comma-separated NIC whitelist (e.g., `mlx5_0,mlx5_2`) |
+| `MC_MS_AUTO_DISC` | unset | Overrides RDMA/EFA topology discovery: `1` forces auto-discovery, `0` disables it. When unset, clients auto-discover if `rdma_devices` is empty |
+| `MC_MS_FILTERS` | empty | Comma-separated NIC whitelist for auto-discovery (e.g., `mlx5_0,mlx5_2`) |
 
-When `MC_MS_AUTO_DISC=0`, pass `rdma_devices` (comma-separated) to the Python `setup()` call.
+When `MC_MS_AUTO_DISC=0`, pass `rdma_devices` (comma-separated) to the Python
+`setup()` call.
 
 ### Transfer Engine Metrics (disabled by default)
 
