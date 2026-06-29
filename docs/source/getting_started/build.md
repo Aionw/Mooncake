@@ -20,191 +20,140 @@ pip install mooncake-transfer-engine-non-cuda
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies, but it still requires the system runtime libraries used by the transfer stack. On Ubuntu, install them with `sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2`.
 > **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
 
-## Automatic Build
+## Source Build
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
 - cmake: 3.20.x
 - gcc: 9.4+
 
-### Steps
-1. Install dependencies, stable Internet connection is required:
-   ```bash
-   sudo bash dependencies.sh
-   ```
-
-2. In the root directory of this project, run the following commands:
-   ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
-   ```
-3. Install Mooncake python package and mooncake_master executable
-   ```bash
-   sudo make install
-   ```
-
-**Build with NVMe-oF SSD Pool**
-
-To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
-Mooncake with `USE_NOF` enabled:
+### Install dependencies
+Use `dependencies.sh` as the single entry point for source-build dependencies. The script detects the current Linux distribution, installs the matching system packages, initializes submodules, installs yalantinglibs, installs the required Go version, and prints a dependency summary after it finishes.
 
 ```bash
-sudo bash dependencies.sh --with-spdk
+sudo bash dependencies.sh
+```
 
-mkdir build
+Useful options:
+- `-y, --yes`: skip the interactive confirmation.
+- `--with-spdk`: also install SPDK for NVMe-oF SSD pool support.
+- `--with-cuda`, `--with-musa`, `--with-mlu`, `--with-maca`, `--with-ascend`, `--with-ubshmem`, `--with-rocm`, `--with-hygon`, `--with-corex`: require the selected vendor SDK to be present and print the matching CMake options.
+- `--check`: print detected toolchain, library, RDMA, and optional SDK information without installing anything.
+- `--cmake-args`: print only the CMake options implied by the selected `--with-*` arguments.
+- `--skip-submodules`: skip submodule initialization when submodules are already prepared.
+- `--skip-yalantinglibs`: skip rebuilding `extern/yalantinglibs`.
+- `--skip-go`: skip Go installation when your environment already provides a compatible version.
+
+Examples:
+```bash
+# Inspect the current environment first.
+bash dependencies.sh --check
+
+# Non-interactive dependency installation.
+sudo bash dependencies.sh -y
+
+# Install dependencies for NVMe-oF SSD pool builds.
+sudo bash dependencies.sh -y --with-spdk
+
+# Validate CUDA before installing common dependencies.
+bash dependencies.sh --check --with-cuda
+
+# Validate Neuware and print the CMake flags for MLU builds.
+bash dependencies.sh --check --with-mlu
+
+# Generate CMake options from the same dependency choices.
+bash dependencies.sh --cmake-args --with-cuda --with-spdk
+```
+
+### Build Mooncake
+In the root directory of this project, run:
+
+```bash
+mkdir -p build
 cd build
-cmake .. -DUSE_NOF=ON
+cmake ..
 make -j
 sudo make install
 ```
 
-`-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
-`-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
+When building with optional SDKs, use `--cmake-args` to keep the dependency choices and CMake configuration aligned:
 
-## Manual Build
+```bash
+CMAKE_ARGS="$(bash dependencies.sh --cmake-args --with-cuda)"
+cmake -S . -B build ${CMAKE_ARGS}
+cmake --build build -j
+sudo cmake --install build
+```
 
-### Recommended Version
-- cmake: 3.22.x
-- boost-devel: 1.66.x
-- googletest: 1.12.x
-- gcc: 10.2.1
-- go: 1.22+
-- hiredis
-- curl
+For NVMe-oF SSD pool support, install SPDK through the dependency script and enable `USE_NOF`:
 
-### Steps
+```bash
+sudo bash dependencies.sh --with-spdk
 
-1. Install dependencies from system software repository:
-    ```bash
-    # For debian/ubuntu
-    apt-get install -y build-essential \
-                       cmake \
-                       libibverbs-dev \
-                       libgoogle-glog-dev \
-                       libgtest-dev \
-                       libjsoncpp-dev \
-                       libnuma-dev \
-                       libunwind-dev \
-                       libpython3-dev \
-                       libboost-dev \
-                       libssl-dev \
-                       pybind11-dev \
-                       libcurl4-openssl-dev \
-                       libhiredis-dev \
-                       pkg-config \
-                       patchelf
+CMAKE_ARGS="$(bash dependencies.sh --cmake-args --with-spdk)"
+cmake -S . -B build ${CMAKE_ARGS}
+cmake --build build -j
+sudo cmake --install build
+```
 
-    # For centos/alibaba linux os
-    yum install cmake \
-                gflags-devel \
-                glog-devel \
-                libibverbs-devel \
-                numactl-devel \
-                gtest \
-                gtest-devel \
-                boost-devel \
-                openssl-devel \
-                hiredis-devel \
-                libcurl-devel
-    ```
+`-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
 
-    NOTE: You may need to install gtest, glog, gflags from source code:
-    ```bash
-    git clone https://github.com/gflags/gflags
-    git clone https://github.com/google/glog
-    git clone https://github.com/abseil/googletest.git
-    ```
+### Optional accelerator SDKs
+`dependencies.sh` installs common build and runtime dependencies from the OS package manager. Vendor SDKs such as CUDA, MUSA, Neuware, MACA, Ascend CANN, ROCm, DTK, and CoreX should still be installed from their vendor distributions, but the script can validate them when you pass the matching `--with-*` option. Run `bash dependencies.sh --check --with-cuda` or `bash dependencies.sh --check --with-mlu` after installing an SDK to confirm what the script detects and which CMake flags to use.
 
-2. If you want to compile the GPUDirect support module, first follow the instructions in https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ to install CUDA (ensure to enable `nvidia-fs` for proper `cuFile` module compilation). After that:
-    1) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cuFile`, `cudart`, and other libraries during compilation:
-    ```bash
-    export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
-    ```
-    ```{admonition} GPU-Direct RDMA
-    :class: note
-    Mooncake could use the DMA-BUF path for GPU-Direct RDMA, which does **not** require the `nvidia-peermem` kernel module. If you prefer the DMA-BUF path, please set the runtime environment variable `WITH_NVIDIA_PEERMEM=0` before starting Mooncake. If you prefer the legacy `ibv_reg_mr` path (which requires `nvidia-peermem`), set the runtime environment variable `WITH_NVIDIA_PEERMEM=1`. See Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for instructions on installing `nvidia-peermem`.
-    ```
+**NVIDIA CUDA / GPUDirect**
+Follow the [CUDA Linux installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/) and enable `nvidia-fs` if you need `cuFile` support. Then make sure CUDA libraries are visible during build and runtime:
+```bash
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
+```
 
-3. If you want to compile the Moore Mthreads GPUDirect support module, first follow the instructions in https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide to install MUSA. After that:
-    1) Install `mthreads-peermem` for enabling GPU-Direct RDMA
-    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `musart`, and other libraries during compilation:
-    ```bash
-    export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
-    ```
+```{admonition} GPU-Direct RDMA
+:class: note
+Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not** require the `nvidia-peermem` kernel module. If you prefer the DMA-BUF path, set `WITH_NVIDIA_PEERMEM=0` before starting Mooncake. If you prefer the legacy `ibv_reg_mr` path, set `WITH_NVIDIA_PEERMEM=1`. See Section 3.7 of the [GPUDirect RDMA guide](https://docs.nvidia.com/cuda/gpudirect-rdma/) for `nvidia-peermem` instructions.
+```
 
-4. If you want to compile Cambricon MLU support, first install the Cambricon Neuware SDK. After that:
-    1) Export `NEUWARE_HOME` or pass `-DNEUWARE_ROOT=/path/to/neuware` to CMake
-    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cnrt`, `cndrv`, and other Neuware libraries during compilation:
-    ```bash
-    export NEUWARE_HOME=/usr/local/neuware
-    export LIBRARY_PATH=$LIBRARY_PATH:${NEUWARE_HOME}/lib64
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${NEUWARE_HOME}/lib64
-    ```
+**Moore Threads MUSA**
+Install the MUSA SDK from the [MUSA SDK installation guide](https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide), install `mthreads-peermem` for GPU-Direct RDMA, and expose the runtime libraries:
+```bash
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
+```
 
-    If your Neuware installation lives outside the default include/library layout, you can also pass:
-    ```bash
-    cmake .. -DUSE_MLU=ON \
-      -DMLU_INCLUDE_DIR=/path/to/neuware/include \
-      -DMLU_LIB_DIR=/path/to/neuware/lib64
-    ```
+**Cambricon MLU / Neuware**
+Install the Cambricon Neuware SDK, then export `NEUWARE_HOME` or pass `-DNEUWARE_ROOT=/path/to/neuware` to CMake:
+```bash
+export NEUWARE_HOME=/usr/local/neuware
+export LIBRARY_PATH=$LIBRARY_PATH:${NEUWARE_HOME}/lib64
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${NEUWARE_HOME}/lib64
 
-    For Cambricon MLU builds, enable the MLU backend explicitly:
-    ```bash
-    cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
-    make -j
-    ```
+cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
+make -j
+```
 
-5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_ROOT` (defaults to `MACA_HOME` env var if set, otherwise `/opt/maca`). SDK layouts vary; include both `lib` and `lib64` in runtime paths when needed:
-    ```bash
-    export MACA_HOME=/opt/maca
-    export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
-    ```
-    Build with `-DUSE_MACA=ON`. Optional overrides:
-    - `-DMACA_ROOT=/path/to/maca`
-    - `-DMACA_INCLUDE_DIR=/path/to/maca/include`
-    - `-DMACA_LIB_DIR=/path/to/maca/lib64`
-    - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated CMake list)
+If your Neuware installation lives outside the default include/library layout, pass `-DMLU_INCLUDE_DIR=/path/to/neuware/include` and `-DMLU_LIB_DIR=/path/to/neuware/lib64`.
 
-6. If you want to compile Huawei Ascend NPU support, first install the Ascend CANN Toolkit following the instructions at https://www.hiascend.com/document. After that:
-    1) Source `set_env.sh` in the CANN installation directory to configure the build environment (no need to manually set `ASCEND_HOME_PATH` or other related environment variables).
-    2) Mooncake provides two Ascend NPU transport paths, choose one as needed:
-       - `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine. (refer to [Version Compatibility Guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md) for details).
-       - `-DUSE_UBSHMEM=ON`: Shared memory transport based on CANN VMM APIs (requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5).
+**MetaX MACA**
+Install the MACA SDK so headers and libraries are available under `MACA_ROOT` or `MACA_HOME`. SDK layouts vary; include both `lib` and `lib64` when needed:
+```bash
+export MACA_HOME=/opt/maca
+export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
+```
 
-    Example for building with Ascend NPU:
-    ```bash
-    source /usr/local/Ascend/cann/set_env.sh
-    cmake .. -DUSE_ASCEND_DIRECT=ON
-    make -j
-    ```
+Build with `-DUSE_MACA=ON`. Optional overrides include `-DMACA_ROOT=/path/to/maca`, `-DMACA_INCLUDE_DIR=/path/to/maca/include`, `-DMACA_LIB_DIR=/path/to/maca/lib64`, and `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`.
 
-7. Install yalantinglibs
-    ```bash
-    git clone https://github.com/alibaba/yalantinglibs.git
-    cd yalantinglibs
-    mkdir build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    make -j$(nproc)
-    make install
-    ```
+**Huawei Ascend CANN**
+Install Ascend CANN Toolkit from [Huawei Ascend documentation](https://www.hiascend.com/document), then source `set_env.sh` in the CANN installation directory:
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+cmake .. -DUSE_ASCEND_DIRECT=ON
+make -j
+```
 
-8. In the root directory of this project, run the following commands:
-   ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
-   ```
-
-9. Install Mooncake python package and mooncake_master executable
-   ```bash
-   make install
-   ```
+Mooncake provides two Ascend NPU transport paths:
+- `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine. Refer to the [Version Compatibility Guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md) for details.
+- `-DUSE_UBSHMEM=ON`: shared memory transport based on CANN VMM APIs. Requires CANN >= 9.0.0, driver >= 26.0.0, and Lingqu >= 1.5.
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. You can either build the image from
