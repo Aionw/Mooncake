@@ -4326,8 +4326,16 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    Replica::Descriptor descriptor;
-    return TryGetReadableReplicaDescriptor(replica, descriptor);
+    // The verdict of TryGetReadableReplicaDescriptor without the descriptor
+    // it builds for a reader. The descriptor only supplies the endpoint to
+    // check against invalid_replica_endpoints_, so it is built only while that
+    // set holds one; eviction asks this of every replica it surveys.
+    if (!invalid_replica_endpoints_.empty()) {
+        Replica::Descriptor descriptor;
+        return TryGetReadableReplicaDescriptor(replica, descriptor);
+    }
+    return replica.is_completed() && !replica.has_invalid_mem_handle() &&
+           !replica.has_invalid_nof_handle() && replica.is_available();
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {

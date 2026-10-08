@@ -346,31 +346,17 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+    // True while the replica's storage can serve a read: a buffer still
+    // allocated on a live segment whose client is serving, or a local-disk
+    // owner that is still serving. Other kinds carry no such state.
+    [[nodiscard]] bool is_available() const {
         if (is_memory_replica()) {
             const auto& data = std::get<MemoryReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_nof_replica()) {
-            const auto& data = std::get<NoFReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            if (!record || !record->IsServing()) {
-                return false;
-            }
-        }
-        descriptor = get_descriptor();
-        if (is_memory_replica()) {
-            return std::get<MemoryReplicaData>(data_).buffer->isAvailable();
+            return data.buffer && data.buffer->isAvailable();
         }
         if (is_nof_replica()) {
-            return std::get<NoFReplicaData>(data_).buffer->isAvailable();
+            const auto& data = std::get<NoFReplicaData>(data_);
+            return data.buffer && data.buffer->isAvailable();
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
@@ -379,6 +365,16 @@ class Replica {
             return record && record->IsServing();
         }
         return true;
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (!is_available()) {
+            return false;
+        }
+        descriptor = get_descriptor();
+        // Checked again: the storage can go away while the descriptor is
+        // built, and a reader must not be handed one that already has.
+        return is_available();
     }
 
     [[nodiscard]] ReplicaID id() const { return id_; }
