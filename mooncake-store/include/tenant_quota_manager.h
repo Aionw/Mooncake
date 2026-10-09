@@ -4,16 +4,16 @@
 // table holding one stable account per tenant, and the effective quotas the
 // table derives from them and the cluster's allocatable capacity.
 //
-// The data plane never comes here: it charges and releases the account a
-// tenant was bound to (TenantQuotaBinding, handed out by the tenant registry
-// with the tenant), and each object keeps its share in its own ledger. This
-// class decides how large every account is.
+// The data plane never comes here: TenantQuotaPolicy charges and releases the
+// account it hung on each tenant when the tenant was created, and each key
+// keeps what its object is charged in its policy word. This class decides how
+// large every account is.
 //
 // A disabled manager meters nothing: every tenant counts as registered and no
 // account is ever handed out.
 //
 // Lock order: the policy lock, then (outside it) the master's snapshot lock and
-// an entry lock, then the recompute lock, then the table's shard locks. The
+// a key lock, then the recompute lock, then the table's shard locks. The
 // capacity callback runs under the recompute lock and must take nothing above
 // it.
 

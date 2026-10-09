@@ -40,7 +40,9 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
 }
 
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
-    service_.EvictTenantsOverWatermark();
+    // The policy throttles its pass; a test asks for one now.
+    service_.tenant_quota_policy_->next_eviction_check_ = {};
+    service_.tenant_quota_policy_->OnMaintenance(service_.policy_store_access_);
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {

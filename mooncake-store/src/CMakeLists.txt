@@ -33,6 +33,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     promotion_candidate_tracker.cpp
     master_service.cpp
     tenant_quota_manager.cpp
+    tenant_quota_policy.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_snapshot_manager.cpp
@@ -51,7 +52,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_read_access.cpp
     segment.cpp
     tenant_quota.cpp
-    tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp

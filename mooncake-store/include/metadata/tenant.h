@@ -1,34 +1,78 @@
 #pragma once
 
-// Tenant: one tenant's object route and the list of its objects with work in
-// flight. Quota, replica-action leases and promotion candidates belong to
-// their own subsystems, which hold their own state and validate it against the
-// object the route holds before acting.
+// Tenant: one tenant's object route, the list of its objects with work in
+// flight, and the namespace policy over it, if any. Replica-action leases and
+// promotion candidates belong to their own subsystems, which hold their own
+// state and validate it against the object the route holds before acting.
 //
 // The route (route::ObjectRoute) owns the keys, their locks, the objects and
-// the group index; the tenant only adds the in-flight list, which it keeps in
-// step with every write guard the route releases.
+// the group index; the tenant keeps the in-flight list in step with every
+// write guard the route releases, and reports each release to the policy.
 
 #include <array>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include <ylt/util/tl/expected.hpp>
 
 #include "common/intrusive_list.h"
 #include "common/transparent_string_hash.h"
+#include "metadata/namespace_policy.h"
 #include "route/object_route.h"
+#include "tenant_id.h"
+#include "types.h"
 
 namespace mooncake {
 namespace metadata {
 
 class Tenant final : private route::RouteObserver {
    public:
-    Tenant() : objects(this) {}
+    // `policy`, when set, outlives the tenant; `attachment` is what it hung on
+    // this tenant when it was created.
+    explicit Tenant(TenantId id = {}, NamespacePolicy* policy = nullptr,
+                    std::unique_ptr<PolicyAttachment> attachment = nullptr)
+        : objects(this),
+          id_(std::move(id)),
+          policy_(policy),
+          attachment_(std::move(attachment)) {}
     Tenant(const Tenant&) = delete;
     Tenant& operator=(const Tenant&) = delete;
 
     route::ObjectRoute objects;
+
+    const TenantId& id() const { return id_; }
+
+    // The policy's say on the object `guard` holds taking `bytes` more memory,
+    // asked before the memory is allocated; zero bytes asks only whether the
+    // tenant admits writes. Always granted without a policy.
+    [[nodiscard]] tl::expected<void, ErrorCode> Grow(
+        const route::WriteGuard& guard, uint64_t bytes) const {
+        if (policy_ == nullptr) {
+            return {};
+        }
+        return policy_->OnGrow(PolicyContext{id_, attachment_.get(), guard},
+                               bytes);
+    }
+
+    // Tell the policy the object `guard` holds is about to be replaced under
+    // this same lock, or torn down for good; see NamespacePolicy::OnReplace
+    // and OnTearDown.
+    void BeforeReplace(const route::WriteGuard& guard) const {
+        if (policy_ != nullptr) {
+            policy_->OnReplace(PolicyContext{id_, attachment_.get(), guard});
+        }
+    }
+    void BeforeTearDown(const route::WriteGuard& guard) const {
+        if (policy_ != nullptr) {
+            policy_->OnTearDown(PolicyContext{id_, attachment_.get(), guard});
+        }
+    }
+
+    PolicyAttachment* policy_attachment() const { return attachment_.get(); }
 
     // True when the tenant holds no object and no group membership.
     [[nodiscard]] bool Empty() const { return objects.Empty(); }
@@ -57,10 +101,18 @@ class Tenant final : private route::RouteObserver {
     }
 
    private:
+    void OnWriteRelease(const route::WriteGuard& guard) override {
+        SyncInFlight(guard);
+        if (policy_ != nullptr) {
+            policy_->OnWriteRelease(
+                PolicyContext{id_, attachment_.get(), guard});
+        }
+    }
+
     // Puts the held key on the in-flight list or takes it off, to match
     // whether it holds an object that carries work. The stripe lock is taken
     // only when that changed.
-    void OnWriteRelease(const route::WriteGuard& guard) override {
+    void SyncInFlight(const route::WriteGuard& guard) {
         route::SlotOwnerState& owner = guard.owner_state();
         const bool listed =
             guard.has_object() && guard.state().HasInFlightWork();
@@ -93,6 +145,10 @@ class Tenant final : private route::RouteObserver {
     InFlightStripe& InFlightStripeOf(std::string_view key) {
         return in_flight_[TransparentStringHash{}(key) % kInFlightStripeCount];
     }
+
+    const TenantId id_;
+    NamespacePolicy* const policy_;
+    const std::unique_ptr<PolicyAttachment> attachment_;
 
     // The keys with work in flight. Declared after the route so it is
     // destroyed first: the route's slots must outlive the hooks the list

@@ -138,7 +138,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     // Config for the tenant-scoped eviction watermark. Two settings here are
     // load-bearing rather than incidental:
-    //   default_kv_lease_ttl(0) -- EvictTenantMemoryForQuota skips any object
+    //   default_kv_lease_ttl(0) -- EvictNamespaceMemory skips any object
     //     whose lease is still live, so with the 10 s default the pass under
     //     test would be a no-op and the assertions would pass for the wrong
     //     reason.
@@ -262,32 +262,32 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 #endif
 
-    // Charges through the tenant's quota binding, the way every data-plane
-    // path does.
+    // Asks the tenant's policy to grow an object under a probe key, the way
+    // every data-plane path does; the probe publishes nothing, so whatever was
+    // granted is given back as the key is released.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        return GetOrCreateTenantHandleForTest(service, tenant_id)
-            .quota()
-            .Charge(bytes);
+        auto tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+        const auto hold = tenant->objects.WriteOrCreate("quota-probe");
+        return tenant->Grow(hold, bytes);
     }
 
-    // The tenant for one tenant id with its quota binding, created through the
-    // registry's factory on first use, which binds its quota account.
-    metadata::TenantHandle GetOrCreateTenantHandleForTest(
+    // The tenant for one tenant id, created through the registry's factory on
+    // first use, which hangs its quota account on it.
+    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandleForTest(
         MasterService& service, const TenantId& tenant_id) {
         return MasterServiceTestPeer(service).GetOrCreateTenantHandle(
             tenant_id);
     }
 
-    // The one quota account bound to that tenant.
+    // The one quota account of that tenant.
     TenantQuotaHandle GetBoundTenantQuotaHandleForTest(
         MasterService& service, const TenantId& tenant_id) {
-        auto tenant =
-            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
-        if (tenant == nullptr) {
+        if (MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id) ==
+            nullptr) {
             return nullptr;
         }
-        return tenant.quota().Account();
+        return &MasterServiceTestPeer(service).TenantQuotaAccount(tenant_id);
     }
 
     // Sweeps one tenant: its objects are its whole route, so no key is named.
@@ -336,7 +336,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
-            entry, removed_ids, MasterServiceTestPeer::QuotaEraseMode::kFull);
+            entry, removed_ids, MasterServiceTestPeer::EraseMode::kFull);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
@@ -500,15 +500,14 @@ TEST_F(MasterServiceTenantQuotaTest,
     // ...and that tenant owns exactly one bound account.
     EXPECT_EQ(first_handle, second_handle);
 
-    auto charge = first_tenant.quota().Charge(128);
-    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
+    ASSERT_TRUE(first_handle->TryCharge(128).has_value());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
 
-    second_tenant.quota().Release(128);
+    ASSERT_TRUE(second_handle->Release(128).has_value());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
-TEST_F(MasterServiceTenantQuotaTest, DroppedReservationGivesTheChargeBack) {
+TEST_F(MasterServiceTenantQuotaTest, GrowthAKeyNeverUsesIsGivenBack) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
@@ -516,25 +515,22 @@ TEST_F(MasterServiceTenantQuotaTest, DroppedReservationGivesTheChargeBack) {
     ASSERT_NE(tenant, nullptr);
 
     {
-        auto reservation = tenant.quota().Reserve(128);
-        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
+        // Granted growth is charged at once...
+        const auto hold = tenant->objects.WriteOrCreate("never-published");
+        auto grown = tenant->Grow(hold, 128);
+        ASSERT_TRUE(grown.has_value()) << toString(grown.error());
         EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
     }
+    // ...and given back once the key is released holding no object.
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 
+    // A refused growth charges nothing.
     {
-        auto reservation = tenant.quota().Reserve(128);
-        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
-        EXPECT_EQ(reservation->Commit(), 128);
+        const auto hold = tenant->objects.WriteOrCreate("never-published");
+        auto too_large = tenant->Grow(hold, UINT64_C(1) << 40);
+        ASSERT_FALSE(too_large.has_value());
+        EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     }
-    // Committed: the caller owes the bytes now, so the drop keeps them.
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
-    tenant.quota().Release(128);
-
-    // A rejected reservation charges nothing.
-    auto too_large = tenant.quota().Reserve(UINT64_C(1) << 40);
-    ASSERT_FALSE(too_large.has_value());
-    EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 

@@ -98,8 +98,8 @@ struct ObjectState {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
-    // One word for the owner's hooks.
-    uint64_t hook_word{0};
+    // Two words for the owner's namespace policy.
+    std::array<uint64_t, 2> policy_words{};
 };
 
 class ObjectRoute;
@@ -394,6 +394,12 @@ class ObjectRoute {
             ObjectRef ref() const { return {key(), generation()}; }
             Metadata& metadata() const { return *slot_.record_->metadata; }
             State& state() const { return slot_.record_->state; }
+            // The owner's per-slot state, for the route's owner only.
+            SlotOwnerState& owner_state() const
+                requires kWrite
+            {
+                return slot_.owner_;
+            }
 
            private:
             friend class Cursor;

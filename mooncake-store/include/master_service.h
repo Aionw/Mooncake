@@ -42,8 +42,8 @@
 #include "promotion_candidate_tracker.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
-#include "tenant_quota_ledger.h"
-#include "tenant_quota_manager.h"
+#include "metadata/namespace_policy.h"
+#include "tenant_quota_policy.h"
 #include "types.h"
 #include "weight_store_manager.h"
 #include "master_config.h"
@@ -100,11 +100,12 @@ class MasterServiceTestPeer;
  *
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. tenant_quota_'s policy lock (TenantQuotaManager::LockPolicy)
+ * 2. the namespace policy's admission token (NamespacePolicy::AdmitWrite;
+ *    the tenant quota policy's policy lock)
  * 3. snapshot_mutex_
  * 4. one key's lock, taken through its tenant's route (route::ObjectRoute);
  *    a thread holds at most one at a time
- * 5. tenant_quota_'s recompute lock
+ * 5. the tenant quota policy's recompute lock
  * 6. the quota table's shard locks or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex and everything an object operation reaches
  *    from the key lock: the tenant's group index and in-flight list, the
@@ -1015,18 +1016,12 @@ class MasterService {
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
-    struct TenantQuotaEvictionResult {
-        uint64_t freed_bytes{0};
-        uint64_t evicted_objects{0};
-    };
-    TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const TenantId& tenant_id, uint64_t target_bytes);
-
-    // Background pass: evict any tenant that is over its own watermark down to
-    // (watermark - eviction_ratio) of its effective quota. Called from
-    // EvictionThreadFunc, and a no-op unless multi-tenancy and
-    // tenant_eviction_high_watermark_ratio are both enabled.
-    void EvictTenantsOverWatermark();
+    using NamespaceEvictionResult = StoreControl::EvictionResult;
+    // Evicts memory replicas of one namespace's objects, oldest lease first,
+    // until `target_bytes` are freed or nothing more qualifies; what a policy
+    // asks for through StoreControl.
+    NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                                 uint64_t target_bytes);
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
@@ -1152,7 +1147,7 @@ class MasterService {
     // ClearInvalidHandles sweeps those. With HA and the oplog on, both are
     // cleaned through the oplog. False when it tore the object down.
     [[nodiscard]] bool CleanupInvalidMemoryReplicas(
-        const TenantId& tenant_id, const metadata::TenantHandle& tenant,
+        const TenantId& tenant_id, const std::shared_ptr<metadata::Tenant>& tenant,
         const route::WriteGuard& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
@@ -1188,14 +1183,16 @@ class MasterService {
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(const route::WriteGuard&,
-                                               const metadata::TenantHandle&)>&
+                                               const std::shared_ptr<metadata::Tenant>&)>&
             evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
-    enum class QuotaEraseMode {
+    // How an erase is published to KV-event subscribers: as the object's
+    // removal, or, when an upsert replaces it under the same lock, as the
+    // state the replacement starts from.
+    enum class EraseMode {
         kFull,
-        kPreserveOld,
-        kAbortOnly,
+        kReplace,
     };
 
     // Erases the object `hold` holds and every record that hangs off its key,
@@ -1204,30 +1201,33 @@ class MasterService {
     // eraser does not release its refcounts, quota charges and KV removal
     // events again. Returns whether this call tore it down.
     [[nodiscard]] bool EraseMetadata(
-        const metadata::TenantHandle& tenant,
+        const std::shared_ptr<metadata::Tenant>& tenant,
         const route::WriteGuard& hold, const TenantId& tenant_id,
-        QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
+        EraseMode erase_mode = EraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
     // object itself.
     void ReleaseObjectRecords(
-        TenantQuotaBinding quota, const route::WriteGuard& hold,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode,
+        const route::WriteGuard& hold, const TenantId& tenant_id,
+        EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint);
-    tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
-        TenantQuotaBinding quota, ObjectMetadata& metadata);
-    uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
-                                        const ReplicateConfig& config) const;
-    // Restore: rebuilds every object's quota ledger and every tenant's usage
-    // from the restored metadata.
-    void RebuildTenantQuotaUsageFromMetadata();
+    // The memory a write of `value_length` bytes under `config` asks the
+    // namespace policy for before it allocates.
+    uint64_t RequestedMemoryGrowth(uint64_t value_length,
+                                   const ReplicateConfig& config) const;
+    // Restore: lets the namespace policy rebuild what it derives from the
+    // restored metadata.
+    void NotifyPolicyRestored();
+    // A segment came or went: lets the namespace policy re-derive what it
+    // carves from the allocatable memory.
+    void NotifyPolicyCapacityChanged();
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        const std::vector<ReplicaID>& replica_ids, EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint = {});
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id,
-                                           QuotaEraseMode quota_mode);
+                                           EraseMode erase_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
@@ -1271,16 +1271,13 @@ class MasterService {
     // holds the object's own lock and passes the envelope and state it holds.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantQuotaBinding quota, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
-    // accounting (quota release, promotion-task cancellation) rather than
-    // duplicating it.
+    // accounting (promotion-task cancellation) rather than duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantQuotaBinding quota, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::function<bool(const Replica&)>& is_stale);
 
     // True when client_id currently has a LOCAL_DISK registration.
@@ -1302,14 +1299,13 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     // Publishes a new object under the key `hold` holds, which must hold none.
-    auto InsertMetadata(const metadata::TenantHandle& tenant,
+    auto InsertMetadata(const std::shared_ptr<metadata::Tenant>& tenant,
                         const route::WriteGuard& hold, const UUID& client_id,
                         uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
-                        uint64_t pending_quota_charge,
                         std::optional<std::chrono::system_clock::time_point>
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -1318,7 +1314,7 @@ class MasterService {
     // the key `hold` holds, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        const metadata::TenantHandle& tenant, const route::WriteGuard& hold,
+        const std::shared_ptr<metadata::Tenant>& tenant, const route::WriteGuard& hold,
         const UUID& client_id, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1333,7 +1329,7 @@ class MasterService {
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
-        const metadata::TenantHandle& tenant, const TenantId& tenant_id,
+        const std::shared_ptr<metadata::Tenant>& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1411,16 +1407,14 @@ class MasterService {
     void ClearCandidatesForReload();
     size_t RunPromotionCandidateRetry();
 
-    // Erase any in-flight PromotionTask for the entry, refund its pending
-    // charge, and decrement the cluster-wide in-flight counter. Safe no-op if
-    // no task exists. The caller holds the key's lock.
-    void ErasePromotionTaskLocked(TenantQuotaBinding quota,
-                                  route::ObjectState& state);
+    // Erase any in-flight PromotionTask for the object and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists. The caller
+    // holds the key's lock.
+    void ErasePromotionTaskLocked(route::ObjectState& state);
     // Cancels a promotion task whose alloc_id is among the removed replicas.
     // The caller holds the object's own lock.
     void CancelPromotionTaskForRemovedReplicas(
-        TenantQuotaBinding quota, ObjectMetadata& metadata,
-        route::ObjectState& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1437,11 +1431,6 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
-    // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
-    // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
-    // sufficient once quotas partition the pool.
-    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
@@ -1450,12 +1439,6 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
-    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
-    // every registered tenant and lock every quota shard, so it is throttled
-    // rather than run on each tick. Quota pressure builds over seconds, not
-    // milliseconds, and admission still has its own synchronous fallback in
-    // between.
-    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
@@ -1520,16 +1503,20 @@ class MasterService {
         }
 
         metadata::Tenant& GetTenant() { return *tenant_; }
-        const metadata::TenantHandle& GetTenantHandle() const {
+        const std::shared_ptr<metadata::Tenant>& GetTenantHandle() const {
             return tenant_;
         }
-        TenantQuotaBinding GetQuota() const { return tenant_.quota(); }
-
         const std::string& GetKey() const { return object_id_.user_key; }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return hold_->ref(); }
 
         const route::WriteGuard& GetHold() const { return *hold_; }
+
+        // The namespace policy's say on the held object taking `bytes` more
+        // memory; see metadata::Tenant::Grow.
+        [[nodiscard]] tl::expected<void, ErrorCode> Grow(uint64_t bytes) const {
+            return tenant_->Grow(*hold_, bytes);
+        }
 
         ObjectMetadata& Get() { return hold_->metadata(); }
 
@@ -1541,7 +1528,7 @@ class MasterService {
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
             (void)service_->EraseMetadata(tenant_, *hold_, object_id_.tenant_id,
-                                          QuotaEraseMode::kFull,
+                                          EraseMode::kFull,
                                           previous_media_hint);
         }
 
@@ -1560,7 +1547,7 @@ class MasterService {
 
         MasterService* service_;
         ObjectIdentity object_id_;
-        metadata::TenantHandle tenant_;
+        std::shared_ptr<metadata::Tenant> tenant_;
         std::optional<route::WriteGuard> hold_;
     };
 
@@ -1632,7 +1619,6 @@ class MasterService {
         }
 
         const metadata::Tenant& GetTenant() const { return *tenant_; }
-        TenantQuotaBinding GetQuota() const { return tenant_.quota(); }
 
         const std::string& GetKey() const { return object_id_.user_key; }
         // The held publication; like `Get()`, only while one is held.
@@ -1644,7 +1630,7 @@ class MasterService {
 
        private:
         const ObjectIdentity object_id_;
-        metadata::TenantHandle tenant_;
+        std::shared_ptr<metadata::Tenant> tenant_;
         std::optional<route::ReadGuard> hold_;
     };
 
@@ -1766,10 +1752,27 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
-    const bool enable_multi_tenants_;
-    // Tenant quota policies and the account sizes derived from them. The
-    // charges themselves go through each tenant (metadata::Tenant).
-    TenantQuotaManager tenant_quota_;
+    // What the namespace policy may see and ask of this service.
+    class PolicyStoreAccess final : public StoreControl {
+       public:
+        explicit PolicyStoreAccess(MasterService& service)
+            : service_(service) {}
+        void VisitNamespaces(
+            const std::function<void(const TenantId&, PolicyAttachment*,
+                                     route::ObjectRoute&)>& fn) override;
+        size_t ObjectCount(const TenantId& tenant_id) const override;
+        uint64_t AllocatableMemoryBytes() const override;
+        EvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
+                                            uint64_t target_bytes) override;
+
+       private:
+        MasterService& service_;
+    };
+    PolicyStoreAccess policy_store_access_{*this};
+    // Multi-tenancy, when enabled; the namespace policy below points at it.
+    std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
+    // The policy every namespace is created under; null without one.
+    NamespacePolicy* policy_ = nullptr;
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled

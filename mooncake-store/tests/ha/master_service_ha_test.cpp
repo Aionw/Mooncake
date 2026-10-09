@@ -851,11 +851,11 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Get().lease_->ExpiresAt();
     }
 
-    static uint64_t EvictTenantMemoryForQuotaForTesting(
+    static uint64_t EvictNamespaceMemoryForTesting(
         MasterService& service, const TenantId& tenant_id,
         uint64_t target_bytes) {
         return MasterServiceTestPeer(service)
-            .EvictTenantMemoryForQuota(tenant_id, target_bytes)
+            .EvictNamespaceMemory(tenant_id, target_bytes)
             .freed_bytes;
     }
 
@@ -1048,7 +1048,7 @@ class MasterServiceHATest : public ::testing::Test {
         const std::vector<ReplicaID>& replica_ids) {
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
             durable_entry, replica_ids,
-            MasterServiceTestPeer::QuotaEraseMode::kFull);
+            MasterServiceTestPeer::EraseMode::kFull);
     }
 
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,
@@ -1623,7 +1623,7 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
         /*evict_ratio_target=*/1.0,
         /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
-    EXPECT_EQ(EvictTenantMemoryForQuotaForTesting(service, kDefaultTenant,
+    EXPECT_EQ(EvictNamespaceMemoryForTesting(service, kDefaultTenant,
                                                   object_size),
               0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);

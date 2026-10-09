@@ -13,18 +13,14 @@
 // resolved. The registry locks only its own map: each tenant synchronizes its
 // own containers.
 //
-// A tenant is registered with its quota binding, and a lookup hands both out
-// as one TenantHandle, so a caller that charges or releases quota needs no
-// second lookup and the tenant itself knows nothing of quotas.
-//
 // The factory is bound once at construction, so every tenant of one registry is
-// built the same way and a caller only names the tenant it wants; it is where a
-// tenant's quota account is resolved and bound. It runs before the registry
-// lock is taken, so it may take other locks (the quota table's) without
-// nesting them under this one, and a handle never escapes before the tenant it
-// names is fully built. Racing creators of one id may each run it,
-// and only one result is published, so it must have no effect that cannot be
-// repeated, and it must not re-enter this registry.
+// built the same way and a caller only names the tenant it wants; it is where
+// whatever a policy hangs on a tenant is resolved. It runs before the registry
+// lock is taken, so it may take other locks without nesting them under this
+// one, and a handle never escapes before the tenant it names is fully built.
+// Racing creators of one id may each run it, and only one result is
+// published, so it must have no effect that cannot be repeated, and it must
+// not re-enter this registry.
 //
 // Alive is not current: `Remove` drops the tenant from the registry while a
 // handle a caller already holds stays valid, and a later get-or-create for the
@@ -42,61 +38,21 @@
 
 #include "metadata/tenant.h"
 #include "tenant_id.h"
-#include "tenant_quota_binding.h"
 
 namespace mooncake {
 namespace metadata {
 
-// A strong handle to a tenant together with the tenant's quota binding. It
-// reads like the tenant's own handle (`->`, `*`, a null check, and it converts
-// to one), so a caller that only routes ignores `quota()`.
-class TenantHandle {
-   public:
-    TenantHandle() = default;
-    TenantHandle(std::nullptr_t) {}
-    // An unmetered tenant unless `quota` binds it. Explicit, so a bare tenant
-    // pointer never turns into a handle that silently charges nothing.
-    explicit TenantHandle(std::shared_ptr<Tenant> tenant,
-                          TenantQuotaBinding quota = {})
-        : tenant_(std::move(tenant)), quota_(quota) {}
-
-    Tenant* operator->() const { return tenant_.get(); }
-    Tenant& operator*() const { return *tenant_; }
-    Tenant* get() const { return tenant_.get(); }
-    explicit operator bool() const { return tenant_ != nullptr; }
-    operator std::shared_ptr<Tenant>() const { return tenant_; }
-
-    const std::shared_ptr<Tenant>& tenant() const { return tenant_; }
-    TenantQuotaBinding quota() const { return quota_; }
-
-    friend bool operator==(const TenantHandle& lhs, const TenantHandle& rhs) {
-        return lhs.tenant_ == rhs.tenant_;
-    }
-    friend bool operator!=(const TenantHandle& lhs, const TenantHandle& rhs) {
-        return !(lhs == rhs);
-    }
-    friend bool operator==(const TenantHandle& handle, std::nullptr_t) {
-        return handle.tenant_ == nullptr;
-    }
-    friend bool operator!=(const TenantHandle& handle, std::nullptr_t) {
-        return handle.tenant_ != nullptr;
-    }
-
-   private:
-    std::shared_ptr<Tenant> tenant_;
-    TenantQuotaBinding quota_;
-};
-
 class TenantRegistry {
    public:
-    // One tenant id in, one initialized tenant and its quota binding out.
-    using TenantFactory = std::function<TenantHandle(const TenantId&)>;
+    // One tenant id in, one initialized tenant out.
+    using TenantFactory =
+        std::function<std::shared_ptr<Tenant>(const TenantId&)>;
 
     explicit TenantRegistry(TenantFactory factory)
         : factory_(std::move(factory)) {}
 
     // Null when the tenant is absent.
-    [[nodiscard]] TenantHandle Lookup(const TenantId& tenant_id) const {
+    [[nodiscard]] std::shared_ptr<Tenant> Lookup(const TenantId& tenant_id) const {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         const auto it = tenants_.find(tenant_id);
         return it == tenants_.end() ? nullptr : it->second;
@@ -106,7 +62,7 @@ class TenantRegistry {
     // the one Tenant the winner published; a loser's build is dropped. The
     // shared lookup covers the common case, so the factory runs and the
     // exclusive lock is taken on a miss only.
-    [[nodiscard]] TenantHandle GetOrCreateTenant(const TenantId& tenant_id) {
+    [[nodiscard]] std::shared_ptr<Tenant> GetOrCreateTenant(const TenantId& tenant_id) {
         if (auto tenant = Lookup(tenant_id)) {
             return tenant;
         }
@@ -131,7 +87,7 @@ class TenantRegistry {
     // walk, and a tenant removed during the walk is still visited.
     template <typename Fn>
     void Visit(Fn&& fn) const {
-        std::vector<std::pair<TenantId, TenantHandle>> tenants;
+        std::vector<std::pair<TenantId, std::shared_ptr<Tenant>>> tenants;
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             tenants.assign(tenants_.begin(), tenants_.end());
@@ -145,7 +101,7 @@ class TenantRegistry {
     const TenantFactory factory_;
     // Shared by lookups and walks, exclusive for the rare creates and removes.
     mutable std::shared_mutex mutex_;
-    std::unordered_map<TenantId, TenantHandle, TenantIdHash> tenants_;
+    std::unordered_map<TenantId, std::shared_ptr<Tenant>, TenantIdHash> tenants_;
 };
 
 }  // namespace metadata
