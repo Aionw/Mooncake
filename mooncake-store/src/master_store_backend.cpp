@@ -16,8 +16,8 @@ bool MasterStoreBackend::CanPublishWeightMutations() const {
 
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
     const TenantId tenant(tenant_id);
-    return tenant.IsValid() &&
-           (master_.IsTenantQuotaEnabled() || tenant == TenantId::Default());
+    return tenant.IsValid() && (master_.tenant_quota_policy() != nullptr ||
+                                tenant == TenantId::Default());
 }
 
 tl::expected<OpLogEntry, ErrorCode>

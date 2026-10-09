@@ -534,7 +534,12 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static uint64_t TenantUsedBytes(MasterService& service) {
-        auto snapshot = service.GetTenantQuotaSnapshot(kDefaultTenant);
+        const TenantQuotaPolicy* quota = service.tenant_quota_policy();
+        EXPECT_NE(quota, nullptr);
+        if (quota == nullptr) {
+            return 0;
+        }
+        auto snapshot = quota->GetSnapshot(kDefaultTenant);
         EXPECT_TRUE(snapshot.has_value());
         return snapshot ? snapshot->charged_bytes : 0;
     }
@@ -1581,6 +1586,8 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
                           {{tenant_id.value(), object_size}}))
                       .build();
     MasterService service(config);
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
 
     const std::string key = "standby_quota_key";
     const std::string endpoint = "standby_quota_segment";
@@ -1592,11 +1599,11 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
-    auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+    auto snapshot = quota->GetSnapshot(tenant_id);
     ASSERT_TRUE(snapshot.has_value());
     EXPECT_EQ(snapshot->charged_bytes, object_size);
     ASSERT_TRUE(service.Remove(key, tenant_id, /*force=*/true).has_value());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
+    EXPECT_EQ(quota->GetSnapshot(tenant_id)->charged_bytes, 0);
 }
 
 TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
@@ -4508,6 +4515,8 @@ TEST_F(MasterServiceHATest,
                 {{kDefaultTenant.value(), 2 * object_size}}))
             .build();
     MasterService service(service_config);
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     ASSERT_EQ(
         ErrorCode::OK,
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
@@ -4544,7 +4553,7 @@ TEST_F(MasterServiceHATest,
     }
     auto move_end = move_future.get();
     ASSERT_TRUE(move_end.has_value()) << toString(move_end.error());
-    ASSERT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+    ASSERT_EQ(quota->GetSnapshot(kDefaultTenant)->charged_bytes,
               2 * object_size);
 
     ReplicateConfig config;
@@ -4558,8 +4567,7 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 4, batch);
     uint64_t charged_bytes = 2 * object_size;
     for (int i = 0; i < 50 && charged_bytes == 2 * object_size; ++i) {
-        charged_bytes =
-            service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes;
+        charged_bytes = quota->GetSnapshot(kDefaultTenant)->charged_bytes;
         if (charged_bytes == 2 * object_size) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -4569,8 +4577,7 @@ TEST_F(MasterServiceHATest,
     auto upsert_end = service.UpsertEnd(source.client_id, key, kDefaultTenant,
                                         ReplicaType::MEMORY);
     ASSERT_TRUE(upsert_end.has_value()) << toString(upsert_end.error());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
-              object_size);
+    EXPECT_EQ(quota->GetSnapshot(kDefaultTenant)->charged_bytes, object_size);
 }
 
 TEST_F(MasterServiceHATest,

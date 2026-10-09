@@ -154,19 +154,10 @@ class MasterService {
     ~MasterService();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
-    bool IsTenantQuotaEnabled() const;
-    // Whether writes to the tenant are admitted; always true with
-    // multi-tenancy off. A point-in-time answer: a write that must not race a
-    // policy delete checks it under the policy lock instead.
-    bool IsTenantRegistered(const TenantId& tenant_id) const;
-    std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
-    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
-        const TenantId& tenant_id) const;
-    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
-        const TenantId& tenant_id, uint64_t requested_quota_bytes);
-    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
-    DeleteTenantQuotaPolicy(const TenantId& tenant_id);
-    uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    // Multi-tenancy's control plane; null when multi-tenancy is off.
+    TenantQuotaPolicy* tenant_quota_policy() const {
+        return tenant_quota_policy_.get();
+    }
 
     WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
         const AcquireWeightRevisionLeaseRequest& request);
@@ -1215,6 +1206,9 @@ class MasterService {
     // namespace policy for before it allocates.
     uint64_t RequestedMemoryGrowth(uint64_t value_length,
                                    const ReplicateConfig& config) const;
+    // The memory every segment mounted on this service adds up to,
+    // saturating at the 64-bit range; what tenant quotas are carved from.
+    uint64_t AllocatableMemoryBytes();
     // Restore: lets the namespace policy rebuild what it derives from the
     // restored metadata.
     void NotifyPolicyRestored();

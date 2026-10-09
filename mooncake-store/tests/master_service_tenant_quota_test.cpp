@@ -227,7 +227,12 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     TenantQuotaSnapshot Snapshot(MasterService& service,
                                  const TenantId& tenant_id) {
-        auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+        const TenantQuotaPolicy* quota = service.tenant_quota_policy();
+        EXPECT_NE(quota, nullptr);
+        if (quota == nullptr) {
+            return {};
+        }
+        auto snapshot = quota->GetSnapshot(tenant_id);
         EXPECT_TRUE(snapshot.has_value());
         return *snapshot;
     }
@@ -433,9 +438,8 @@ TEST_F(MasterServiceTenantQuotaTest, SingleTenantModeDisablesQuota) {
     // (WrappedSingleTenantModeCollapsesRequestTenants), and no tenant is
     // metered.
     PutComplete(service, client_id, "shared-key", TenantId::Default(), 800);
-    EXPECT_TRUE(service.IsTenantRegistered(TenantId("tenant-a")));
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId::Default()).has_value());
+    // No policy to meter a tenant or to refuse one.
+    EXPECT_EQ(service.tenant_quota_policy(), nullptr);
     EXPECT_TRUE(service
                     .Remove("shared-key", TenantId::Default(),
                             /*force=*/true)
@@ -445,6 +449,8 @@ TEST_F(MasterServiceTenantQuotaTest, SingleTenantModeDisablesQuota) {
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeRejectsUnregisteredAndImplicitDefaultWrites) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountSegment(service);
 
     auto missing = service.PutStart(client_id, "missing", TenantId("tenant-b"),
@@ -460,8 +466,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     const std::string control_tenant("tenant\0bad", 10);
     EXPECT_FALSE(TenantId(control_tenant).IsValid());
 
-    auto register_default =
-        service.UpsertTenantQuotaPolicy(TenantId::Default(), 100);
+    auto register_default = quota->UpsertPolicy(TenantId::Default(), 100);
     ASSERT_TRUE(register_default.has_value())
         << toString(register_default.error());
     PutComplete(service, client_id, "registered-default", TenantId::Default(),
@@ -584,6 +589,8 @@ TEST_F(MasterServiceTenantQuotaTest,
                       .set_tenant_quota_connector_uri(initial_policy)
                       .build();
     MasterService service(config);
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountSegment(service);
 
     StorageObjectMetadata metadata;
@@ -602,13 +609,11 @@ TEST_F(MasterServiceTenantQuotaTest,
     }
     ReloadTenantQuotaPolicyFromStore(service);
 
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(quota->GetSnapshot(TenantId("tenant-b")).has_value());
 
     EXPECT_TRUE(service.Remove("cold", TenantId("tenant-b"), /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(quota->GetSnapshot(TenantId("tenant-b")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -729,6 +734,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        RegisteredTenantQuotaAdmissionDoesNotCreateImplicitTenants) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 100}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountSegment(service);
 
     auto hard_pinned = MemoryConfig();
@@ -748,8 +755,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 80);
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(quota->GetSnapshot(TenantId("tenant-b")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest, PutRevokeRefundsStartCharge) {
@@ -1037,17 +1043,18 @@ TEST_F(MasterServiceTenantQuotaTest, MoveEndSettlesToFinalReplicaCharge) {
 
 TEST_F(MasterServiceTenantQuotaTest, DeletePolicyRequiresTenantWithoutObjects) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountSegment(service);
     PutComplete(service, client_id, "key", TenantId("tenant-a"), 100);
 
-    auto delete_non_empty =
-        service.DeleteTenantQuotaPolicy(TenantId("tenant-a"));
+    auto delete_non_empty = quota->DeletePolicy(TenantId("tenant-a"));
     ASSERT_FALSE(delete_non_empty.has_value());
     EXPECT_EQ(delete_non_empty.error(), ErrorCode::TENANT_NOT_EMPTY);
 
-    auto upsert = service.UpsertTenantQuotaPolicy(TenantId("tenant-b"), 100);
+    auto upsert = quota->UpsertPolicy(TenantId("tenant-b"), 100);
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
-    auto delete_empty = service.DeleteTenantQuotaPolicy(TenantId("tenant-b"));
+    auto delete_empty = quota->DeletePolicy(TenantId("tenant-b"));
     ASSERT_TRUE(delete_empty.has_value()) << toString(delete_empty.error());
     EXPECT_FALSE(delete_empty.value().has_value());
 }
@@ -1055,6 +1062,8 @@ TEST_F(MasterServiceTenantQuotaTest, DeletePolicyRequiresTenantWithoutObjects) {
 TEST_F(MasterServiceTenantQuotaTest,
        DeletePolicyBlocksValidatedChargesBeforeConnectorSave) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     MountSegment(service);
 
     TenantQuotaPolicySnapshot current_policy;
@@ -1069,8 +1078,7 @@ TEST_F(MasterServiceTenantQuotaTest,
         tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>;
     std::optional<DeleteResult> delete_result;
     std::thread delete_thread([&] {
-        delete_result.emplace(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
+        delete_result.emplace(quota->DeletePolicy(TenantId("tenant-a")));
     });
 
     if (save_started.wait_for(std::chrono::seconds(5)) !=
@@ -1095,13 +1103,14 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(delete_result.has_value());
     ASSERT_TRUE(delete_result->has_value()) << toString(delete_result->error());
     EXPECT_FALSE(delete_result->value().has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
+    EXPECT_FALSE(quota->GetSnapshot(TenantId("tenant-a")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
        DeletePolicyWaitsForInFlightAddReplicaBeforeEmptyCheck) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountSegment(service);
 
     TenantQuotaPolicySnapshot current_policy;
@@ -1132,8 +1141,7 @@ TEST_F(MasterServiceTenantQuotaTest,
         tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>;
     std::optional<DeleteResult> delete_result;
     std::thread delete_thread([&] {
-        delete_result.emplace(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
+        delete_result.emplace(quota->DeletePolicy(TenantId("tenant-a")));
     });
 
     const auto premature_save =
@@ -1162,6 +1170,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        DeletePolicySeesZeroChargePutStartMetadataCreateWithoutPolicyLock) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    TenantQuotaPolicy* quota = service.tenant_quota_policy();
+    ASSERT_NE(quota, nullptr);
     UUID client_id = MountNoFSegment(service);
 
     auto blocking_strategy = std::make_shared<BlockingAllocationStrategy>();
@@ -1195,8 +1205,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     std::promise<DeleteResult> delete_promise;
     auto delete_future = delete_promise.get_future();
     std::thread delete_thread([&] {
-        delete_promise.set_value(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
+        delete_promise.set_value(quota->DeletePolicy(TenantId("tenant-a")));
     });
 
     EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),

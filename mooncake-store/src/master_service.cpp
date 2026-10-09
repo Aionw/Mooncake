@@ -755,44 +755,6 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     return snapshot;
 }
 
-bool MasterService::IsTenantQuotaEnabled() const {
-    return tenant_quota_policy_ != nullptr;
-}
-
-std::vector<TenantQuotaSnapshot> MasterService::ListTenantQuotaSnapshots()
-    const {
-    if (tenant_quota_policy_ == nullptr) {
-        return {};
-    }
-    return tenant_quota_policy_->ListSnapshots();
-}
-
-std::optional<TenantQuotaSnapshot> MasterService::GetTenantQuotaSnapshot(
-    const TenantId& tenant_id) const {
-    if (tenant_quota_policy_ == nullptr) {
-        return std::nullopt;
-    }
-    return tenant_quota_policy_->GetSnapshot(tenant_id);
-}
-
-tl::expected<TenantQuotaSnapshot, ErrorCode>
-MasterService::UpsertTenantQuotaPolicy(const TenantId& tenant_id,
-                                       uint64_t requested_quota_bytes) {
-    if (tenant_quota_policy_ == nullptr) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    return tenant_quota_policy_->UpsertPolicy(tenant_id,
-                                              requested_quota_bytes);
-}
-
-tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
-MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
-    if (tenant_quota_policy_ == nullptr) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    return tenant_quota_policy_->DeletePolicy(tenant_id);
-}
-
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
@@ -1311,11 +1273,6 @@ std::string MasterService::GetClientHostId(const UUID& client_id) const {
     return it == client_host_id_.end() ? std::string() : it->second;
 }
 
-bool MasterService::IsTenantRegistered(const TenantId& tenant_id) const {
-    return tenant_quota_policy_ == nullptr ||
-           tenant_quota_policy_->IsTenantRegistered(tenant_id);
-}
-
 void MasterService::NotifyPolicyRestored() {
     if (policy_ != nullptr) {
         policy_->OnRestored(policy_store_access_);
@@ -1344,7 +1301,7 @@ size_t MasterService::PolicyStoreAccess::ObjectCount(
 }
 
 uint64_t MasterService::PolicyStoreAccess::AllocatableMemoryBytes() const {
-    return service_.GetTenantQuotaAllocatableCapacityBytes();
+    return service_.AllocatableMemoryBytes();
 }
 
 StoreControl::EvictionResult
@@ -1363,7 +1320,7 @@ uint64_t MasterService::RequestedMemoryGrowth(
     return static_cast<uint64_t>(charge);
 }
 
-uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
+uint64_t MasterService::AllocatableMemoryBytes() {
     uint64_t capacity = 0;
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::pair<Segment, UUID>> segments;
@@ -8048,7 +8005,8 @@ MasterService::SubmitReplicaActionProposalLocked(
 
     const ObjectIdentity object_id{TenantId(proposal.tenant_id), proposal.key};
     // No new replica for an object whose tenant lost its policy.
-    if (!IsTenantRegistered(object_id.tenant_id)) {
+    if (tenant_quota_policy_ != nullptr &&
+        !tenant_quota_policy_->IsTenantRegistered(object_id.tenant_id)) {
         return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
 
