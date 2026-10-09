@@ -13,8 +13,8 @@
 // through the sweep before PutEnd could exercise the accessor's own cleanup.
 //
 // The child asserts the publication cannot be torn down again, its in-flight
-// work went with it and the key holds no object, and reports that through its exit
-// code: a forked child turns a crash into a test failure.
+// work went with it and the key holds no object, and reports that through its
+// exit code: a forked child turns a crash into a test failure.
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"

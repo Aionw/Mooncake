@@ -148,16 +148,15 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     // The index only names keys, so each key is resolved again under its own
     // lock; a key that holds no object any more is skipped.
-    service_.namespaces_.Visit(
-        [&](const TenantId& tenant_id, metadata::Namespace& ns) {
-            for (const auto& key :
-                 service_.promotion_candidates_.Keys(tenant_id)) {
-                auto hold = ns.objects.Write(key);
-                if (hold && hold->state().promotion_candidate.has_value()) {
-                    hold->state().promotion_candidate->retry_after = epoch;
-                }
+    service_.namespaces_.Visit([&](const TenantId& tenant_id,
+                                   metadata::Namespace& ns) {
+        for (const auto& key : service_.promotion_candidates_.Keys(tenant_id)) {
+            auto hold = ns.objects.Write(key);
+            if (hold && hold->state().promotion_candidate.has_value()) {
+                hold->state().promotion_candidate->retry_after = epoch;
             }
-        });
+        }
+    });
 }
 
 size_t MasterServiceTestPeer::SoftPinHeapSize() const {

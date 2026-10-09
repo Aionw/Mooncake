@@ -48,8 +48,8 @@ class PromotionCandidateTracker {
     // Whether a rejection is worth retrying: the gate it hit clears on its own.
     static bool IsTransient(PromotionQueueResult result);
 
-    // The keys of one tenant whose object carried a candidate when indexed, as a
-    // snapshot to resolve again.
+    // The keys of one tenant whose object carried a candidate when indexed, as
+    // a snapshot to resolve again.
     std::vector<std::string> Keys(const TenantId& tenant_id) const;
 
     // --- Per-object candidate; the caller holds the key lock ---------------

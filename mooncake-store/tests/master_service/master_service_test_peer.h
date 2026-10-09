@@ -452,7 +452,8 @@ class MasterServiceTestPeer {
     }
 
     // The tenant's one stable quota account.
-    mooncake::TenantQuotaAccount& TenantQuotaAccount(const TenantId& tenant_id) {
+    mooncake::TenantQuotaAccount& TenantQuotaAccount(
+        const TenantId& tenant_id) {
         return service_.tenant_quota_policy_->manager_.AccountFor(tenant_id);
     }
 

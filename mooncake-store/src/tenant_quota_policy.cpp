@@ -65,10 +65,9 @@ uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
 }  // namespace
 
 TenantQuotaPolicy::TenantQuotaPolicy(StoreView& store, Options options)
-    : store_(store),
-      options_(options),
-      manager_(/*enabled=*/true,
-               [this] { return store_.AllocatableMemoryBytes(); }) {}
+    : store_(store), options_(options), manager_(/*enabled=*/true, [this] {
+          return store_.AllocatableMemoryBytes();
+      }) {}
 
 void TenantQuotaPolicy::OpenPolicyStoreOrThrow(const std::string& type,
                                                const std::string& uri,

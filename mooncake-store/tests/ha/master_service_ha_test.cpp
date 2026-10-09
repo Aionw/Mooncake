@@ -856,9 +856,9 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Get().lease_->ExpiresAt();
     }
 
-    static uint64_t EvictNamespaceMemoryForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        uint64_t target_bytes) {
+    static uint64_t EvictNamespaceMemoryForTesting(MasterService& service,
+                                                   const TenantId& tenant_id,
+                                                   uint64_t target_bytes) {
         return MasterServiceTestPeer(service)
             .EvictNamespaceMemory(tenant_id, target_bytes)
             .freed_bytes;
@@ -1630,9 +1630,9 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
         /*evict_ratio_target=*/1.0,
         /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
-    EXPECT_EQ(EvictNamespaceMemoryForTesting(service, kDefaultTenant,
-                                                  object_size),
-              0);
+    EXPECT_EQ(
+        EvictNamespaceMemoryForTesting(service, kDefaultTenant, object_size),
+        0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
     EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
     auto get = service.GetReplicaList(key, kDefaultTenant);

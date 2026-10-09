@@ -95,8 +95,8 @@ class NamespacePolicy {
     // A request is about to write to `tenant_id`; runs before the core takes
     // any lock. The token is held until the request ends, so it may carry a
     // lock that orders the write against the policy's own control plane.
-    virtual tl::expected<std::unique_ptr<AdmissionToken>, ErrorCode>
-    AdmitWrite(const TenantId& tenant_id) {
+    virtual tl::expected<std::unique_ptr<AdmissionToken>, ErrorCode> AdmitWrite(
+        const TenantId& tenant_id) {
         (void)tenant_id;
         return std::unique_ptr<AdmissionToken>{};
     }

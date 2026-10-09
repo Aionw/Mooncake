@@ -809,9 +809,8 @@ TEST_F(MasterServiceTest,
         // full allocator the way a slow eviction validation leaves it.
         const MasterServiceTestPeer::ObjectIdentity blocked_object{
             TenantId::Default(), old_keys.front()};
-        ASSERT_TRUE(
-            MasterServiceTestPeer::FindObject(service, blocked_object)
-                .has_value());
+        ASSERT_TRUE(MasterServiceTestPeer::FindObject(service, blocked_object)
+                        .has_value());
         std::atomic<bool> release_blocked_entry{false};
         std::thread blocker([&] {
             auto hold =

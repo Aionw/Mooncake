@@ -197,10 +197,13 @@ class Guard {
     // the record. The caller gives back whatever hangs off the object first,
     // under this same guard. A later Publish on the guard starts a new
     // publication of the key with nothing in between.
-    void TearDown() const requires kWrite;
+    void TearDown() const
+        requires kWrite;
 
     // The owner's per-slot state, for the route's owner only.
-    SlotOwnerState& owner_state() const requires kWrite {
+    SlotOwnerState& owner_state() const
+        requires kWrite
+    {
         return slot_->owner_;
     }
     KeySlot& slot() const { return *slot_; }
@@ -208,10 +211,11 @@ class Guard {
    private:
     friend class ObjectRoute;
 
-    Guard(ObjectRoute* route, std::shared_ptr<KeySlot> slot)
-        NO_THREAD_SAFETY_ANALYSIS : route_(route),
-                                    slot_(std::move(slot)),
-                                    lock_(slot_->mutex_) {}
+    Guard(ObjectRoute* route,
+          std::shared_ptr<KeySlot> slot) NO_THREAD_SAFETY_ANALYSIS
+        : route_(route),
+          slot_(std::move(slot)),
+          lock_(slot_->mutex_) {}
 
     // Marks the guard as handed to a caller, so its release is reported to
     // the observer; one the route takes and drops itself, finding the key
@@ -388,9 +392,7 @@ class ObjectRoute {
             using State = typename Guard<kMode>::State;
 
             const std::string& key() const { return slot_.key(); }
-            Generation generation() const {
-                return slot_.record_->generation;
-            }
+            Generation generation() const { return slot_.record_->generation; }
             ObjectRef ref() const { return {key(), generation()}; }
             Metadata& metadata() const { return *slot_.record_->metadata; }
             State& state() const { return slot_.record_->state; }
@@ -550,7 +552,8 @@ Generation Guard<kMode>::Publish(std::unique_ptr<ObjectMetadata> metadata) const
 }
 
 template <LockMode kMode>
-void Guard<kMode>::TearDown() const requires kWrite
+void Guard<kMode>::TearDown() const
+    requires kWrite
 {
     assert(has_object());
     route_->TearDownLocked(*slot_);
