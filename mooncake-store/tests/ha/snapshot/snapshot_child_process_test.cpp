@@ -579,7 +579,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         auto handle =
-            MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
+            MasterServiceTestPeer::Namespaces(*svc).Lookup(TenantId::Default());
         return handle != nullptr && handle->objects.Contains(key);
     }
 

@@ -780,9 +780,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     owner));
         }
 
-        MasterServiceTestPeer::Tenants(*service).Visit(
-            [&](const TenantId&, metadata::Tenant& handle) {
-                for (auto object : handle.objects.ReadCursor()) {
+        MasterServiceTestPeer::Namespaces(*service).Visit(
+            [&](const TenantId&, metadata::Namespace& ns) {
+                for (auto object : ns.objects.ReadCursor()) {
                     const auto& metadata = object.metadata();
                     for (const auto& replica : metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {

@@ -753,8 +753,8 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        auto tenant = MasterServiceTestPeer::Tenants(service).Lookup(tenant_id);
-        return tenant != nullptr && tenant->objects.Contains(key);
+        auto ns = MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        return ns != nullptr && ns->objects.Contains(key);
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,

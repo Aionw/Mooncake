@@ -116,16 +116,16 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
 
         // A second teardown of the same publication must find nothing to
         // release: the torn-down publication is not held again.
-        const auto tenant =
-            MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
-        if (tenant == nullptr) {
+        const auto ns = MasterServiceTestPeer::Namespaces(service).Lookup(
+            TenantId::Default());
+        if (ns == nullptr) {
             ::_exit(kExitNotTornDown);
         }
-        if (tenant->objects.Write(*object).has_value()) {
+        if (ns->objects.Write(*object).has_value()) {
             ::_exit(kExitNotTornDown);
         }
         // Its in-flight work went with it.
-        const auto in_flight = tenant->InFlightKeys();
+        const auto in_flight = ns->InFlightKeys();
         if (std::find(in_flight.begin(), in_flight.end(), key) !=
             in_flight.end()) {
             ::_exit(kExitStillProcessing);

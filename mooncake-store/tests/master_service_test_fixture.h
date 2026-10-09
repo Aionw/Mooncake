@@ -474,20 +474,20 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant(tenant_id);
         // Membership is per tenant, so the group id alone is not enough.
-        auto tenant_handle =
-            MasterServiceTestPeer::Tenants(service).Lookup(normalized_tenant);
-        if (tenant_handle == nullptr) {
+        auto ns = MasterServiceTestPeer::Namespaces(service).Lookup(
+            normalized_tenant);
+        if (ns == nullptr) {
             return {};
         }
-        return tenant_handle->objects.GroupMembers(group_id);
+        return ns->objects.GroupMembers(group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
         // Drops every grouped object's membership from its tenant's group
         // index, leaving the group table empty for a rebuild.
-        MasterServiceTestPeer::Tenants(service).Visit(
-            [&](const TenantId&, metadata::Tenant& handle) {
-                test::ObjectRouteTestPeer::DropGroupMemberships(handle.objects);
+        MasterServiceTestPeer::Namespaces(service).Visit(
+            [&](const TenantId&, metadata::Namespace& ns) {
+                test::ObjectRouteTestPeer::DropGroupMemberships(ns.objects);
             });
     }
 
@@ -501,14 +501,13 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant(tenant_id);
-        auto tenant_handle =
-            MasterServiceTestPeer::Tenants(service).Lookup(normalized_tenant);
-        if (tenant_handle == nullptr) {
+        auto ns = MasterServiceTestPeer::Namespaces(service).Lookup(
+            normalized_tenant);
+        if (ns == nullptr) {
             return nullptr;
         }
-        for (const auto& member_key :
-             tenant_handle->objects.GroupMembers(group_id)) {
-            if (auto hold = tenant_handle->objects.Read(member_key)) {
+        for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
+            if (auto hold = ns->objects.Read(member_key)) {
                 return hold->metadata().lease_;
             }
         }

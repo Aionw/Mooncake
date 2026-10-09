@@ -278,10 +278,9 @@ TEST_F(MasterServiceTest, GroupedRoutingIsDecoupledFromGroupMembership) {
 
     // The group id is only what each entry reports; all three objects share the
     // tenant's one route regardless of it.
-    auto tenant_handle =
-        MasterServiceTestPeer::Tenants(*service_).Lookup(tenant);
-    ASSERT_NE(nullptr, tenant_handle);
-    EXPECT_EQ(3u, tenant_handle->objects.ObjectCount());
+    auto ns = MasterServiceTestPeer::Namespaces(*service_).Lookup(tenant);
+    ASSERT_NE(nullptr, ns);
+    EXPECT_EQ(3u, ns->objects.ObjectCount());
     for (const auto& key : {key_a, key_b, survivor_key}) {
         EXPECT_TRUE(
             MasterServiceTestPeer::FindObject(

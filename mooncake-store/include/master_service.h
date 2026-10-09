@@ -35,8 +35,8 @@
 #include "dynamic_replication_controller.h"
 #include "lease.h"
 #include "master_metric_manager.h"
-#include "metadata/tenant.h"
-#include "metadata/tenant_registry.h"
+#include "metadata/namespace.h"
+#include "metadata/namespace_table.h"
 #include "mutex.h"
 #include "route/object_route.h"
 #include "promotion_candidate_tracker.h"
@@ -1063,9 +1063,9 @@ class MasterService {
         std::string user_key;
     };
 
-    // Tenant registry: one tenant per tenant id written to, each owning its
-    // object route; a tenant stays put once created (see TenantRegistry).
-    metadata::TenantRegistry tenants_;
+    // One namespace per tenant id written to, each owning that tenant's object
+    // route; a namespace stays put once created (see NamespaceTable).
+    metadata::NamespaceTable namespaces_;
 
     // Weight revisions: one backend on the service, and every weight RPC
     // resolves through the store it keeps.
@@ -1137,7 +1137,7 @@ class MasterService {
     // ClearInvalidHandles sweeps those. With HA and the oplog on, both are
     // cleaned through the oplog. False when it tore the object down.
     [[nodiscard]] bool CleanupInvalidMemoryReplicas(
-        const TenantId& tenant_id, metadata::Tenant& tenant,
+        const TenantId& tenant_id, metadata::Namespace& ns,
         const route::WriteGuard& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
@@ -1173,7 +1173,7 @@ class MasterService {
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(
-            const route::WriteGuard&, metadata::Tenant&)>& evict_one_member);
+            const route::WriteGuard&, metadata::Namespace&)>& evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     // How an erase is published to KV-event subscribers: as the object's
@@ -1190,7 +1190,7 @@ class MasterService {
     // eraser does not release its refcounts, quota charges and KV removal
     // events again. Returns whether this call tore it down.
     [[nodiscard]] bool EraseMetadata(
-        metadata::Tenant& tenant, const route::WriteGuard& hold,
+        metadata::Namespace& ns, const route::WriteGuard& hold,
         const TenantId& tenant_id, EraseMode erase_mode = EraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
@@ -1290,7 +1290,7 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     // Publishes a new object under the key `hold` holds, which must hold none.
-    auto InsertMetadata(metadata::Tenant& tenant, const route::WriteGuard& hold,
+    auto InsertMetadata(metadata::Namespace& ns, const route::WriteGuard& hold,
                         const UUID& client_id, uint64_t value_length,
                         const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
@@ -1305,7 +1305,7 @@ class MasterService {
     // the key `hold` holds, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        metadata::Tenant& tenant, const route::WriteGuard& hold,
+        metadata::Namespace& ns, const route::WriteGuard& hold,
         const UUID& client_id, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1320,7 +1320,7 @@ class MasterService {
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
-        metadata::Tenant& tenant, const TenantId& tenant_id,
+        metadata::Namespace& ns, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1456,10 +1456,9 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              tenant_(service_->tenants_.Lookup(object_id_.tenant_id)),
-              hold_(tenant_ == nullptr
-                        ? std::nullopt
-                        : tenant_->objects.Write(object_id_.user_key)) {
+              ns_(service_->namespaces_.Lookup(object_id_.tenant_id)),
+              hold_(ns_ == nullptr ? std::nullopt
+                                   : ns_->objects.Write(object_id_.user_key)) {
             CleanUp();
         }
 
@@ -1470,9 +1469,8 @@ class MasterService {
                            CreateKey)
             : service_(service),
               object_id_(std::move(object_id)),
-              tenant_(
-                  &service_->tenants_.GetOrCreateTenant(object_id_.tenant_id)),
-              hold_(tenant_->objects.WriteOrCreate(object_id_.user_key)) {
+              ns_(&service_->namespaces_.GetOrCreate(object_id_.tenant_id)),
+              hold_(ns_->objects.WriteOrCreate(object_id_.user_key)) {
             CleanUp();
         }
 
@@ -1493,7 +1491,7 @@ class MasterService {
             return IsPublished() && hold_->state().replication_task.has_value();
         }
 
-        metadata::Tenant& GetTenant() const { return *tenant_; }
+        metadata::Namespace& GetNamespace() const { return *ns_; }
         const std::string& GetKey() const { return object_id_.user_key; }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return hold_->ref(); }
@@ -1501,9 +1499,9 @@ class MasterService {
         const route::WriteGuard& GetHold() const { return *hold_; }
 
         // The namespace policy's say on the held object taking `bytes` more
-        // memory; see metadata::Tenant::Grow.
+        // memory; see metadata::Namespace::Grow.
         [[nodiscard]] tl::expected<void, ErrorCode> Grow(uint64_t bytes) const {
-            return tenant_->Grow(*hold_, bytes);
+            return ns_->Grow(*hold_, bytes);
         }
 
         ObjectMetadata& Get() { return hold_->metadata(); }
@@ -1515,9 +1513,9 @@ class MasterService {
         }
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            (void)service_->EraseMetadata(
-                *tenant_, *hold_, object_id_.tenant_id, EraseMode::kFull,
-                previous_media_hint);
+            (void)service_->EraseMetadata(*ns_, *hold_, object_id_.tenant_id,
+                                          EraseMode::kFull,
+                                          previous_media_hint);
         }
 
         void EraseFromProcessing() { hold_->state().is_processing = false; }
@@ -1529,13 +1527,13 @@ class MasterService {
         void CleanUp() {
             if (IsPublished()) {
                 (void)service_->CleanupInvalidMemoryReplicas(
-                    object_id_.tenant_id, *tenant_, *hold_);
+                    object_id_.tenant_id, *ns_, *hold_);
             }
         }
 
         MasterService* service_;
         ObjectIdentity object_id_;
-        metadata::Tenant* tenant_;
+        metadata::Namespace* ns_;
         std::optional<route::WriteGuard> hold_;
     };
 
@@ -1566,10 +1564,10 @@ class MasterService {
 
         // Serialize one tenant's metadata, which is one entry of the payload.
         tl::expected<void, SerializationError> SerializeTenant(
-            const TenantId& tenant_id, const metadata::Tenant& tenant,
+            const TenantId& tenant_id, const metadata::Namespace& ns,
             MsgpackPacker& packer) const;
 
-        // Deserialize one tenant's entry of the payload into the registry.
+        // Deserialize one tenant's entry of the payload into its namespace.
         tl::expected<void, SerializationError> DeserializeTenant(
             const msgpack::object& obj);
 
@@ -1590,10 +1588,9 @@ class MasterService {
         MetadataAccessorRO(const MasterService* service,
                            ObjectIdentity object_id)
             : object_id_(std::move(object_id)),
-              tenant_(service->tenants_.Lookup(object_id_.tenant_id)),
-              hold_(tenant_ == nullptr
-                        ? std::nullopt
-                        : tenant_->objects.Read(object_id_.user_key)) {}
+              ns_(service->namespaces_.Lookup(object_id_.tenant_id)),
+              hold_(ns_ == nullptr ? std::nullopt
+                                   : ns_->objects.Read(object_id_.user_key)) {}
 
         bool Exists() const {
             return IsPublished() && hold_->metadata().IsValid();
@@ -1606,7 +1603,7 @@ class MasterService {
             return hold_.has_value() && hold_->state().is_processing;
         }
 
-        const metadata::Tenant& GetTenant() const { return *tenant_; }
+        const metadata::Namespace& GetNamespace() const { return *ns_; }
 
         const std::string& GetKey() const { return object_id_.user_key; }
         // The held publication; like `Get()`, only while one is held.
@@ -1618,7 +1615,7 @@ class MasterService {
 
        private:
         const ObjectIdentity object_id_;
-        metadata::Tenant* tenant_;
+        metadata::Namespace* ns_;
         std::optional<route::ReadGuard> hold_;
     };
 

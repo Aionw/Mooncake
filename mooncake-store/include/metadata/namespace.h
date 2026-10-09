@@ -1,12 +1,12 @@
 #pragma once
 
-// Tenant: one tenant's object route, the list of its objects with work in
+// Namespace: one tenant's object route, the list of its objects with work in
 // flight, and the namespace policy over it, if any. Replica-action leases and
 // promotion candidates belong to their own subsystems, which hold their own
 // state and validate it against the object the route holds before acting.
 //
 // The route (route::ObjectRoute) owns the keys, their locks, the objects and
-// the group index; the tenant keeps the in-flight list in step with every
+// the group index; the namespace keeps the in-flight list in step with every
 // write guard the route releases, and reports each release to the policy.
 
 #include <array>
@@ -29,18 +29,18 @@
 namespace mooncake {
 namespace metadata {
 
-class Tenant final : private route::RouteObserver {
+class Namespace final : private route::RouteObserver {
    public:
-    // `policy`, when set, outlives the tenant; `attachment` is what it hung on
-    // this tenant when it was created.
-    explicit Tenant(TenantId id = {}, NamespacePolicy* policy = nullptr,
-                    std::unique_ptr<PolicyAttachment> attachment = nullptr)
+    // `policy`, when set, outlives the namespace; `attachment` is what it hung
+    // on this namespace when it was created.
+    explicit Namespace(TenantId id = {}, NamespacePolicy* policy = nullptr,
+                       std::unique_ptr<PolicyAttachment> attachment = nullptr)
         : objects(this),
           id_(std::move(id)),
           policy_(policy),
           attachment_(std::move(attachment)) {}
-    Tenant(const Tenant&) = delete;
-    Tenant& operator=(const Tenant&) = delete;
+    Namespace(const Namespace&) = delete;
+    Namespace& operator=(const Namespace&) = delete;
 
     route::ObjectRoute objects;
 
@@ -48,7 +48,7 @@ class Tenant final : private route::RouteObserver {
 
     // The policy's say on the object `guard` holds taking `bytes` more memory,
     // asked before the memory is allocated; zero bytes asks only whether the
-    // tenant admits writes. Always granted without a policy.
+    // namespace admits writes. Always granted without a policy.
     [[nodiscard]] tl::expected<void, ErrorCode> Grow(
         const route::WriteGuard& guard, uint64_t bytes) const {
         if (policy_ == nullptr) {
@@ -74,15 +74,15 @@ class Tenant final : private route::RouteObserver {
 
     PolicyAttachment* policy_attachment() const { return attachment_.get(); }
 
-    // True when the tenant holds no object and no group membership.
+    // True when the namespace holds no object and no group membership.
     [[nodiscard]] bool Empty() const { return objects.Empty(); }
 
     // --- Work in flight ------------------------------------------------------
     //
-    // The tenant lists the keys whose object carries work in flight (see
+    // The namespace lists the keys whose object carries work in flight (see
     // route::ObjectState::HasInFlightWork), so a sweep for expired work walks
     // those instead of every object. Work only starts or finishes under a write
-    // guard, and the route reports every write guard to the tenant as it is
+    // guard, and the route reports every write guard to the namespace as it is
     // released: a key is listed exactly while it holds an object that carries
     // work as of the last write guard on it. A write cursor neither starts nor
     // finishes such work.
@@ -133,7 +133,7 @@ class Tenant final : private route::RouteObserver {
 
     // One stripe of the in-flight list. Starting and finishing a write each
     // touch the list, so it is striped by key, as the route is, rather than
-    // put under one lock for the whole tenant.
+    // put under one lock for the whole namespace.
     struct InFlightStripe {
         mutable std::mutex lock;
         InFlightList slots;

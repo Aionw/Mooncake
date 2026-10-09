@@ -153,14 +153,16 @@ class MasterServiceTestPeer {
         return service.local_ssd_manager_;
     }
 
-    // --- The tenant metadata model ------------------------------------------
-    // One tenant per registered tenant id, owning that tenant's object route,
-    // its group table and its bound quota account. A pass over all objects is
-    // `Visit` over the registry followed by a `ReadCursor` per tenant.
+    // --- The namespace metadata model ---------------------------------------
+    // One namespace per tenant id written to, owning that tenant's object
+    // route and its group table. A pass over all objects is `Visit` over the
+    // table followed by a `ReadCursor` per namespace.
 
-    static auto& Tenants(MasterService& service) { return service.tenants_; }
-    static const auto& Tenants(const MasterService& service) {
-        return service.tenants_;
+    static auto& Namespaces(MasterService& service) {
+        return service.namespaces_;
+    }
+    static const auto& Namespaces(const MasterService& service) {
+        return service.namespaces_;
     }
 
     // The publication the tenant of `object_id` holds under its key, or
@@ -178,13 +180,13 @@ class MasterServiceTestPeer {
     // must take the key by keeping the write guard.
     static std::optional<route::ReadGuard> ReadObject(
         MasterService& service, const ObjectIdentity& object_id) {
-        auto tenant = service.tenants_.Lookup(object_id.tenant_id);
+        auto tenant = service.namespaces_.Lookup(object_id.tenant_id);
         return tenant == nullptr ? std::nullopt
                                  : tenant->objects.Read(object_id.user_key);
     }
     static std::optional<route::WriteGuard> WriteObject(
         MasterService& service, const ObjectIdentity& object_id) {
-        auto tenant = service.tenants_.Lookup(object_id.tenant_id);
+        auto tenant = service.namespaces_.Lookup(object_id.tenant_id);
         return tenant == nullptr ? std::nullopt
                                  : tenant->objects.Write(object_id.user_key);
     }
@@ -391,7 +393,7 @@ class MasterServiceTestPeer {
         const MasterServiceConfig& config);
 
     void DiscardExpiredProcessingReplicas(
-        metadata::Tenant& tenant, const TenantId& tenant_id,
+        metadata::Namespace& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
         service_.DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
     }
@@ -442,11 +444,11 @@ class MasterServiceTestPeer {
         return service_.FindClientRecord(client_id);
     }
 
-    // Resolves the tenant, creating it through the registry's factory on first
+    // Resolves the namespace, creating it through the table's factory on first
     // use; the factory hangs the namespace policy's attachment (the tenant's
     // quota account) on it. The id is taken as given.
-    metadata::Tenant& GetOrCreateTenant(const TenantId& tenant_id) {
-        return service_.tenants_.GetOrCreateTenant(tenant_id);
+    metadata::Namespace& GetOrCreateNamespace(const TenantId& tenant_id) {
+        return service_.namespaces_.GetOrCreate(tenant_id);
     }
 
     // The tenant's one stable quota account.

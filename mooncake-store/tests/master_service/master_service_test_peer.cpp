@@ -118,10 +118,10 @@ size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
 void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     const TenantId& tenant_id, const std::string& key, const UUID& holder_id,
     ReplicaID alloc_id, uint64_t object_size) {
-    metadata::Tenant& tenant = service_.tenants_.GetOrCreateTenant(tenant_id);
+    metadata::Namespace& ns = service_.namespaces_.GetOrCreate(tenant_id);
     // The route is what keeps the object reachable by the completion path, so
     // an absent key is seeded with a publication of its own.
-    const auto hold = tenant.objects.WriteOrCreate(key);
+    const auto hold = ns.objects.WriteOrCreate(key);
     if (!hold.has_object()) {
         hold.Publish(std::make_unique<ObjectMetadata>(
             holder_id, std::chrono::system_clock::now(), object_size,
@@ -148,11 +148,11 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     // The index only names keys, so each key is resolved again under its own
     // lock; a key that holds no object any more is skipped.
-    service_.tenants_.Visit(
-        [&](const TenantId& tenant_id, metadata::Tenant& handle) {
+    service_.namespaces_.Visit(
+        [&](const TenantId& tenant_id, metadata::Namespace& ns) {
             for (const auto& key :
                  service_.promotion_candidates_.Keys(tenant_id)) {
-                auto hold = handle.objects.Write(key);
+                auto hold = ns.objects.Write(key);
                 if (hold && hold->state().promotion_candidate.has_value()) {
                     hold->state().promotion_candidate->retry_after = epoch;
                 }

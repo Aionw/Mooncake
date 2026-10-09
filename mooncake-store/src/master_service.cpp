@@ -158,9 +158,9 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    // The policy is set in the body, before any tenant is created.
-    : tenants_([this](const TenantId& tenant_id) {
-          return std::make_unique<metadata::Tenant>(
+    // The policy is set in the body, before any namespace is created.
+    : namespaces_([this](const TenantId& tenant_id) {
+          return std::make_unique<metadata::Namespace>(
               tenant_id, policy_,
               policy_ == nullptr ? nullptr
                                  : policy_->OnNamespaceCreated(tenant_id));
@@ -1010,15 +1010,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // snapshot_mutex_ is held exclusively, so no object operation runs
         // until the repair below: the replicas this walk collects stay put,
         // and each object it touched is locked again there by its publication.
-        std::vector<std::pair<metadata::Tenant*, route::ObjectRef>>
+        std::vector<std::pair<metadata::Namespace*, route::ObjectRef>>
             affected_objects;
         bool any_standby_kept_alive = std::any_of(
             segments.begin(), segments.end(), [this](const Segment& segment) {
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
         if (any_standby_kept_alive) {
-            tenants_.Visit([&](const TenantId&, metadata::Tenant& tenant) {
-                for (auto object : tenant.objects.WriteCursor()) {
+            namespaces_.Visit([&](const TenantId&, metadata::Namespace& ns) {
+                for (auto object : ns.objects.WriteCursor()) {
                     bool affected = false;
                     auto& metadata = object.metadata();
                     metadata.VisitReplicas(
@@ -1057,7 +1057,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                             }
                         });
                     if (affected) {
-                        affected_objects.emplace_back(&tenant, object.ref());
+                        affected_objects.emplace_back(&ns, object.ref());
                     }
                 }
             });
@@ -1174,8 +1174,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
             standby_allocator_keepalive_.erase(restore.segment.name);
         }
-        for (const auto& [tenant, object] : affected_objects) {
-            auto hold = tenant->objects.Write(object);
+        for (const auto& [ns, object] : affected_objects) {
+            auto hold = ns->objects.Write(object);
             if (!hold) {
                 continue;
             }
@@ -1286,15 +1286,15 @@ void MasterService::NotifyPolicyCapacityChanged() {
 void MasterService::PolicyStoreAccess::VisitNamespaces(
     const std::function<void(const TenantId&, PolicyAttachment*,
                              route::ObjectRoute&)>& fn) {
-    service_.tenants_.Visit(
-        [&](const TenantId& tenant_id, metadata::Tenant& ns) {
+    service_.namespaces_.Visit(
+        [&](const TenantId& tenant_id, metadata::Namespace& ns) {
             fn(tenant_id, ns.policy_attachment(), ns.objects);
         });
 }
 
 size_t MasterService::PolicyStoreAccess::ObjectCount(
     const TenantId& tenant_id) const {
-    const auto ns = service_.tenants_.Lookup(tenant_id);
+    const auto ns = service_.namespaces_.Lookup(tenant_id);
     return ns == nullptr ? 0 : ns->objects.ObjectCount();
 }
 
@@ -1392,11 +1392,11 @@ WeightMetadataStore::Result<void> MasterService::ReleaseWeightRevisionLease(
 
 std::vector<std::string> MasterService::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
         return {};
     }
-    return tenant->objects.GroupMembers(group_id);
+    return ns->objects.GroupMembers(group_id);
 }
 
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
@@ -1404,18 +1404,18 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const std::string& group_id, bool allow_soft_pinned,
     std::chrono::system_clock::time_point now,
     const std::function<MasterService::EvictMemberOutcome(
-        const route::WriteGuard&, metadata::Tenant&)>& evict_one_member) {
+        const route::WriteGuard&, metadata::Namespace&)>& evict_one_member) {
     GroupEvictionResult result;
 
     // The membership is read from the tenant's group table without an object
     // lock, so each key below is re-resolved: a group can be rebuilt while
     // this walk runs and a key may name a different object, or none.
-    const auto found = tenants_.Lookup(tenant_id);
+    const auto found = namespaces_.Lookup(tenant_id);
     if (found == nullptr) {
         return result;
     }
-    metadata::Tenant& tenant = *found;
-    std::vector<std::string> member_keys = tenant.objects.GroupMembers(group_id);
+    metadata::Namespace& ns = *found;
+    std::vector<std::string> member_keys = ns.objects.GroupMembers(group_id);
     if (member_keys.empty()) {
         member_keys.push_back(key);
     }
@@ -1425,7 +1425,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     };
     std::vector<route::ObjectRef> members_to_erase;
     for (const auto& member_key : member_keys) {
-        auto hold = tenant.objects.Write(member_key);
+        auto hold = ns.objects.Write(member_key);
         if (!hold) {
             continue;
         }
@@ -1444,7 +1444,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         // persist, offload, publish). Member teardown happens below, after
         // this lock is released, so no member is erased while another one's
         // lock is held. `key` is the caller's to erase.
-        EvictMemberOutcome member_outcome = evict_one_member(*hold, tenant);
+        EvictMemberOutcome member_outcome = evict_one_member(*hold, ns);
         result.freed_bytes += member_outcome.freed_bytes;
         result.evicted_objects += member_outcome.evicted_objects;
         if (member_outcome.stop_scan) {
@@ -1461,9 +1461,9 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     // Erasing takes each member's lock again and acts only while the key
     // still holds the same publication, so a same-key replacement survives.
     for (const auto& member : members_to_erase) {
-        auto hold = tenant.objects.Write(member);
+        auto hold = ns.objects.Write(member);
         if (hold) {
-            EraseMetadata(tenant, *hold, tenant_id);
+            EraseMetadata(ns, *hold, tenant_id);
         }
     }
     return result;
@@ -1520,11 +1520,11 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
 
 void MasterService::RebuildCacheTotalAccounting() {
     MasterMetricManager::instance().reset_cache_total_nums();
-    tenants_.Visit([](const TenantId&, metadata::Tenant& tenant) {
+    namespaces_.Visit([](const TenantId&, metadata::Namespace& ns) {
         // The objects are visited one at a time: a key can be republished
         // while this walk runs, and the accounting follows the object the
         // key holds when the walk reaches it.
-        for (auto object : tenant.objects.WriteCursor()) {
+        for (auto object : ns.objects.WriteCursor()) {
             SyncCacheTotalAccounting(object.metadata());
         }
     });
@@ -1614,7 +1614,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
-        EraseMetadata(accessor.GetTenant(), accessor.GetHold(), tenant_id,
+        EraseMetadata(accessor.GetNamespace(), accessor.GetHold(), tenant_id,
                       erase_mode, previous_media);
     } else {
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
@@ -1629,19 +1629,19 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     route::ObjectRef object, const TenantId& tenant_id,
     EraseMode erase_mode) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
         return;
     }
     // Act on the pinned publication only: a same-key recreate that landed
     // while the erase was in flight must not be erased, and an object already
     // torn down is not released a second time (refcounts, quota charges, KV
     // removal events).
-    auto hold = tenant->objects.Write(object);
+    auto hold = ns->objects.Write(object);
     if (!hold) {
         return;
     }
-    EraseMetadata(*tenant, *hold, tenant_id, erase_mode);
+    EraseMetadata(*ns, *hold, tenant_id, erase_mode);
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1836,14 +1836,14 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
 // already gone returns false, so a second eraser does not release everything
 // twice.
 bool MasterService::EraseMetadata(
-    metadata::Tenant& tenant, const route::WriteGuard& hold,
+    metadata::Namespace& ns, const route::WriteGuard& hold,
     const TenantId& tenant_id, EraseMode erase_mode,
     const std::vector<std::string>& previous_media_hint) {
     if (!hold.has_object()) {
         return false;
     }
     if (erase_mode == EraseMode::kFull) {
-        tenant.BeforeTearDown(hold);
+        ns.BeforeTearDown(hold);
     }
     ReleaseObjectRecords(hold, tenant_id, erase_mode,
                          previous_media_hint);
@@ -1914,7 +1914,7 @@ void MasterService::ReleaseObjectRecords(
 }
 
 bool MasterService::CleanupInvalidMemoryReplicas(
-    const TenantId& tenant_id, metadata::Tenant& tenant,
+    const TenantId& tenant_id, metadata::Namespace& ns,
     const route::WriteGuard& hold) {
     ObjectMetadata& metadata = hold.metadata();
     route::ObjectState& state = hold.state();
@@ -1941,7 +1941,7 @@ bool MasterService::CleanupInvalidMemoryReplicas(
     if (metadata.IsValid()) {
         return true;
     }
-    (void)EraseMetadata(tenant, hold, tenant_id);
+    (void)EraseMetadata(ns, hold, tenant_id);
     return false;
 }
 
@@ -1972,8 +1972,8 @@ void MasterService::RebuildGroupState() {
     // grouped objects each tenant publishes, so the rebuild is per tenant. The
     // maximum restored deadline per group keeps a grouped object off a
     // zero-deadline lease that post-restore cleanup would drop.
-    tenants_.Visit([](const TenantId&, metadata::Tenant& tenant) {
-        tenant.objects.RebuildGroupState();
+    namespaces_.Visit([](const TenantId&, metadata::Namespace& ns) {
+        ns.objects.RebuildGroupState();
     });
 }
 
@@ -2175,14 +2175,14 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
-    tenants_.Visit(
-        [&](const TenantId& tenant_id, metadata::Tenant& tenant) {
+    namespaces_.Visit(
+        [&](const TenantId& tenant_id, metadata::Namespace& ns) {
             // Reader pre-check: an object with nothing to sweep skips the write
             // path and the invalid-replica cleanup it starts with. The object
             // is re-classified under the write access below, since it may have
             // changed, and one torn down or replaced meanwhile is skipped.
             std::vector<route::ObjectRef> to_sweep;
-            for (auto object : tenant.objects.ReadCursor()) {
+            for (auto object : ns.objects.ReadCursor()) {
                 const auto& metadata = object.metadata();
                 if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
                     to_sweep.push_back(object.ref());
@@ -2194,7 +2194,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 // classifies and tears down itself, and the read-write accessor
                 // would drop the stale replicas before this pass could see what
                 // it erased.
-                auto hold = tenant.objects.Write(object);
+                auto hold = ns.objects.Write(object);
                 if (!hold) {
                     continue;
                 }
@@ -2216,8 +2216,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     }
                     if (CleanupStaleHandles(key, tenant_id, metadata, state,
                                             is_stale)) {
-                        EraseMetadata(tenant, *hold, tenant_id,
-                                      EraseMode::kFull);
+                        EraseMetadata(ns, *hold, tenant_id, EraseMode::kFull);
                     }
                     continue;
                 }
@@ -2246,7 +2245,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     }
                     continue;
                 }
-                EraseMetadata(tenant, *hold, tenant_id, EraseMode::kFull);
+                EraseMetadata(ns, *hold, tenant_id, EraseMode::kFull);
             }
         });
 
@@ -2326,12 +2325,12 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 return false;
             }
             bool unfinished_affiliated_replica = false;
-            tenants_.Visit(
-                [&](const TenantId&, metadata::Tenant& tenant) {
+            namespaces_.Visit(
+                [&](const TenantId&, metadata::Namespace& ns) {
                     if (unfinished_affiliated_replica) {
                         return;
                     }
-                    for (auto object : tenant.objects.ReadCursor()) {
+                    for (auto object : ns.objects.ReadCursor()) {
                         const auto& metadata = object.metadata();
                         if (metadata.HasReplica([&job](const Replica& replica) {
                                 return replica.is_processing() &&
@@ -2452,8 +2451,8 @@ void MasterService::TaskCleanupThreadFunc() {
         CleanupExpiredDynamicReplicationState();
         // A key lock left empty while another caller still held it outlives
         // its last object; drop those here.
-        tenants_.Visit([](const TenantId&, metadata::Tenant& tenant) {
-            (void)tenant.objects.SweepEmptySlots();
+        namespaces_.Visit([](const TenantId&, metadata::Namespace& ns) {
+            (void)ns.objects.SweepEmptySlots();
         });
     }
     LOG(INFO) << "Task cleanup thread stopped";
@@ -2692,11 +2691,11 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
         return all_keys;
     }
-    for (auto object : tenant->objects.ReadCursor()) {
+    for (auto object : ns->objects.ReadCursor()) {
         const std::string& key = object.key();
         const auto& metadata = object.metadata();
         if (!HasReadableReplica(metadata)) {
@@ -3028,7 +3027,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     << tenant_id.value() << ", key=" << user_key;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            const auto existing_tenant = tenants_.Lookup(tenant_id);
+            const auto existing_tenant = namespaces_.Lookup(tenant_id);
             if (existing_tenant != nullptr &&
                 existing_tenant->objects.Contains(user_key)) {
                 LOG(ERROR)
@@ -3177,7 +3176,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
 
         for (const auto& object : prepared_objects) {
-            const auto existing_tenant = tenants_.Lookup(object.tenant_id);
+            const auto existing_tenant = namespaces_.Lookup(object.tenant_id);
             if (existing_tenant != nullptr &&
                 existing_tenant->objects.Contains(object.user_key)) {
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -3203,9 +3202,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         const auto now = std::chrono::system_clock::now();
         for (auto& object : prepared_objects) {
             const auto& standby_meta = object.entry->metadata;
-            metadata::Tenant& tenant =
-                tenants_.GetOrCreateTenant(object.tenant_id);
-            const auto hold = tenant.objects.WriteOrCreate(object.user_key);
+            metadata::Namespace& ns = namespaces_.GetOrCreate(object.tenant_id);
+            const auto hold = ns.objects.WriteOrCreate(object.user_key);
             if (hold.has_object()) {
                 // The pre-validation pass above rejected duplicates, so the
                 // key can only hold an object here if the payload disagrees
@@ -3624,11 +3622,11 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
         return results;
     }
-    for (auto object : tenant->objects.ReadCursor()) {
+    for (auto object : ns->objects.ReadCursor()) {
         const std::string& key = object.key();
         if (std::regex_search(key, pattern)) {
             const auto& metadata = object.metadata();
@@ -4119,7 +4117,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
 }
 
 auto MasterService::InsertMetadata(
-    metadata::Tenant& tenant, const route::WriteGuard& hold,
+    metadata::Namespace& ns, const route::WriteGuard& hold,
     const UUID& client_id, uint64_t value_length, const ReplicateConfig& config,
     const std::string& group_id, const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now,
@@ -4187,7 +4185,7 @@ auto MasterService::InsertMetadata(
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    metadata::Tenant& tenant, const route::WriteGuard& hold,
+    metadata::Namespace& ns, const route::WriteGuard& hold,
     const UUID& client_id, uint64_t value_length, const ReplicateConfig& config,
     const std::string& writer_host_id, const std::string& group_id,
     const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
@@ -4203,7 +4201,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     // Asked before anything is allocated; if the insert below fails, the key
     // is released holding no object and the policy gives the growth back.
-    auto grown = tenant.Grow(hold, RequestedMemoryGrowth(value_length, config));
+    auto grown = ns.Grow(hold, RequestedMemoryGrowth(value_length, config));
     if (!grown) {
         return tl::make_unexpected(grown.error());
     }
@@ -4215,8 +4213,8 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     auto insert_result = InsertMetadata(
-        tenant, hold, client_id, value_length, config, group_id, tenant_id,
-        now, soft_pin_request, std::move(allocation_result.value()),
+        ns, hold, client_id, value_length, config, group_id, tenant_id, now,
+        soft_pin_request, std::move(allocation_result.value()),
         std::move(committed_soft_pin_timeout));
     return insert_result;
 }
@@ -4314,8 +4312,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             auto retaining_clients = GetRetainingClientIdsLocked();
             client_lock.unlock();
-            metadata::Tenant& tenant =
-                tenants_.GetOrCreateTenant(object_id.tenant_id);
+            metadata::Namespace& ns =
+                namespaces_.GetOrCreate(object_id.tenant_id);
             // The accessor holds the key across the stale cleanup and the
             // create, so no other writer of the key lands in between.
             MetadataAccessorRW accessor(this, object_id,
@@ -4378,7 +4376,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
 
             return AllocateAndInsertMetadata(
-                tenant, accessor.GetHold(), client_id, slice_length, config,
+                ns, accessor.GetHold(), client_id, slice_length, config,
                 writer_host_id, group_id, object_id.tenant_id, now,
                 *soft_pin_request, std::nullopt, &dfs_allocation_failed);
         }
@@ -4999,8 +4997,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             client_lock.unlock();
             // Objects are always routed by hash(tenant, key); group_id does
             // not affect routing.
-            metadata::Tenant& tenant =
-                tenants_.GetOrCreateTenant(object_id.tenant_id);
+            metadata::Namespace& ns =
+                namespaces_.GetOrCreate(object_id.tenant_id);
             // The whole read-modify-write runs under the key's lock, held
             // whether or not the key holds an object, so a replacement is
             // published under the same lock that took the old object down
@@ -5133,7 +5131,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (!accessor.IsPublished()) {
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 return AllocateAndInsertMetadata(
-                    tenant, accessor.GetHold(), client_id, slice_length,
+                    ns, accessor.GetHold(), client_id, slice_length,
                     allocation_config, writer_host_id, allocation_group_id,
                     object_id.tenant_id, now, *soft_pin_request,
                     allocation_committed_soft_pin_timeout,
@@ -5299,7 +5297,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             put_start_release_timeout_sec_));
                 // What the old object charges stays on the key until the
                 // replacement's write settles.
-                tenant.BeforeReplace(accessor.GetHold());
+                ns.BeforeReplace(accessor.GetHold());
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
@@ -5311,7 +5309,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // The replacement is published under this same lock, so no
                 // reader or writer finds the key between the two objects.
                 // `metadata` is not used past this point.
-                (void)EraseMetadata(accessor.GetTenant(), accessor.GetHold(),
+                (void)EraseMetadata(accessor.GetNamespace(), accessor.GetHold(),
                                     object_id.tenant_id, EraseMode::kReplace,
                                     previous_kv_media);
 
@@ -5321,14 +5319,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     allocate_result =
                         replacement_replicas.has_value()
                             ? InsertMetadata(
-                                  tenant, accessor.GetHold(), client_id,
+                                  ns, accessor.GetHold(), client_id,
                                   slice_length, allocation_config,
                                   allocation_group_id, object_id.tenant_id, now,
                                   *soft_pin_request,
                                   std::move(*replacement_replicas),
                                   allocation_committed_soft_pin_timeout)
                             : AllocateAndInsertMetadata(
-                                  tenant, accessor.GetHold(), client_id,
+                                  ns, accessor.GetHold(), client_id,
                                   slice_length, allocation_config,
                                   writer_host_id, allocation_group_id,
                                   object_id.tenant_id, now, *soft_pin_request,
@@ -6403,12 +6401,12 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant != nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns != nullptr) {
         // The walk only names the keys to consider: each key is resolved
         // again below, so the checks and the erase stay atomic with it.
         std::vector<std::string> matched_keys;
-        for (auto object : tenant->objects.ReadCursor()) {
+        for (auto object : ns->objects.ReadCursor()) {
             if (std::regex_search(object.key(), pattern)) {
                 matched_keys.push_back(object.key());
             }
@@ -6509,16 +6507,16 @@ long MasterService::RemoveAll(bool force) {
     local_ssd_manager_.RequestRemoveAll();
 
     // Delete metadata — runs concurrently with client SSD cleanup.
-    // The walk collects the tenants present when it starts and releases the
-    // registry lock before the callback runs, so the hook below may commit a
-    // new object (or a new tenant) without deadlocking.
+    // The walk collects the namespaces present when it starts and releases the
+    // table lock before the callback runs, so the hook below may commit a new
+    // object (or a new namespace) without deadlocking.
     size_t tenants_scanned = 0;
-    tenants_.Visit([&](const TenantId& tenant_id, metadata::Tenant& tenant) {
+    namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         // The walk only names the objects that look removable: each is
         // checked again below, so the checks and the erase stay atomic with
         // it.
         std::vector<route::ObjectRef> removable;
-        for (auto object : tenant.objects.ReadCursor()) {
+        for (auto object : ns.objects.ReadCursor()) {
             // Record the tenant only once the loop actually reaches an object.
             // A tenant row can outlive its objects, and recording it
             // unconditionally made every empty-but-present tenant look like a
@@ -6540,7 +6538,7 @@ long MasterService::RemoveAll(bool force) {
             // A plain write hold: the read-write accessor syncs the object's
             // KV state, which bumps the tenant epoch this scan's `cleared`
             // decision is compared against.
-            auto hold = tenant.objects.Write(candidate);
+            auto hold = ns.objects.Write(candidate);
             if (!hold) {
                 continue;
             }
@@ -6595,7 +6593,7 @@ long MasterService::RemoveAll(bool force) {
 
                 total_freed_size += metadata.size * mem_rep_count;
                 ErasePromotionTaskLocked(state);
-                EraseMetadata(tenant, *hold, tenant_id);
+                EraseMetadata(ns, *hold, tenant_id);
                 removed_count++;
             } else {
                 // Only a skipped object means the tenant is not empty.
@@ -6654,13 +6652,13 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // tenants' SSD data.
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
-    const auto tenant = tenants_.Lookup(tenant_id);
-    if (tenant != nullptr) {
+    const auto ns = namespaces_.Lookup(tenant_id);
+    if (ns != nullptr) {
         // The walk only names the objects that look removable: each is
         // checked again below, so the checks and the erase stay atomic with
         // it.
         std::vector<route::ObjectRef> removable;
-        for (auto object : tenant->objects.ReadCursor()) {
+        for (auto object : ns->objects.ReadCursor()) {
             saw_any_object = true;
             const auto& metadata = object.metadata();
             if ((force || metadata.IsLeaseExpired(now)) &&
@@ -6676,7 +6674,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             // A plain write hold: the read-write accessor syncs
             // the object's KV state, which bumps the tenant epoch this scan
             // compares against.
-            auto hold = tenant->objects.Write(candidate);
+            auto hold = ns->objects.Write(candidate);
             if (!hold) {
                 continue;
             }
@@ -6731,7 +6729,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 }
                 total_freed_size += metadata.size * mem_rep_count;
                 ErasePromotionTaskLocked(state);
-                EraseMetadata(*tenant, *hold, tenant_id);
+                EraseMetadata(*ns, *hold, tenant_id);
                 removed_count++;
             } else {
                 skipped_any_object = true;
@@ -6772,7 +6770,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     // A tenant that was never registered owns none of these keys, so each one
     // is reported missing, as the single-key Remove does.
-    if (tenants_.Lookup(tenant_id) == nullptr) {
+    if (namespaces_.Lookup(tenant_id) == nullptr) {
         for (auto& result : results) {
             result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -7026,11 +7024,11 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
             auto now = std::chrono::system_clock::now();
             for (const auto& candidate : candidates) {
-                const auto tenant = tenants_.Lookup(tenant_id);
-                if (tenant == nullptr) {
+                const auto ns = namespaces_.Lookup(tenant_id);
+                if (ns == nullptr) {
                     continue;
                 }
-                const auto hold = tenant->objects.Read(candidate.key);
+                const auto hold = ns->objects.Read(candidate.key);
                 if (!hold) continue;
                 const auto& metadata = hold->metadata();
                 // A key without the candidate replica has already released
@@ -7248,8 +7246,8 @@ void MasterService::RunShardDfsEviction() {
 
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
-    tenants_.Visit([&total](const TenantId&, metadata::Tenant& tenant) {
-        total += tenant.objects.ObjectCount();
+    namespaces_.Visit([&total](const TenantId&, metadata::Namespace& ns) {
+        total += ns.objects.ObjectCount();
     });
     return total;
 }
@@ -7807,11 +7805,11 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
 // --- Promotion retry candidate helpers ---
 
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
-    const auto tenant = tenants_.Lookup(object_id.tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(object_id.tenant_id);
+    if (ns == nullptr) {
         return;
     }
-    if (auto hold = tenant->objects.Write(object_id.user_key)) {
+    if (auto hold = ns->objects.Write(object_id.user_key)) {
         promotion_candidates_.EraseLocked(object_id.tenant_id, hold->key(),
                                           hold->state());
     }
@@ -7819,20 +7817,21 @@ void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
 
 void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                                      PromotionQueueResult result) {
-    const auto tenant = tenants_.Lookup(object_id.tenant_id);
-    if (tenant == nullptr) {
+    const auto ns = namespaces_.Lookup(object_id.tenant_id);
+    if (ns == nullptr) {
         return;
     }
-    if (auto hold = tenant->objects.Write(object_id.user_key)) {
+    if (auto hold = ns->objects.Write(object_id.user_key)) {
         promotion_candidates_.BackoffLocked(
             object_id.tenant_id, hold->key(), hold->state(), result);
     }
 }
 
 void MasterService::ClearCandidatesForReload() {
-    tenants_.Visit([this](const TenantId& tenant_id, metadata::Tenant& tenant) {
+    namespaces_.Visit([this](const TenantId& tenant_id,
+                             metadata::Namespace& ns) {
         // The candidate index lock is a leaf, so it is taken inside the walk.
-        for (auto object : tenant.objects.WriteCursor()) {
+        for (auto object : ns.objects.WriteCursor()) {
             promotion_candidates_.EraseLocked(tenant_id, object.key(),
                                               object.state());
         }
@@ -7855,7 +7854,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
     // much of the cluster one round of retries touches.
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
-        tenants_.Visit([&](const TenantId& tenant_id, metadata::Tenant&) {
+        namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace&) {
             if (due_candidates.size() >= kPromotionRetryBatchSize) {
                 return;
             }
@@ -7943,23 +7942,23 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
         return;
     }
     const int64_t now_ms = DynamicReplicationController::NowMs();
-    // A tenant that ends up with no pending record stays registered: the
-    // registry never drops a tenant while the service serves.
-    tenants_.Visit([&](const TenantId& tenant_id, metadata::Tenant& tenant) {
+    // A namespace that ends up with no pending record stays: the table never
+    // drops one while the service serves.
+    namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         // The publications at detection: the access below acts only while each
         // key still holds the same one, so a key dropped or published again in
         // between is skipped. Its expired task died with the object it
         // belonged to, and the replacement owns pending state of its own that
         // must not be failed here.
         std::vector<route::ObjectRef> expired;
-        for (auto object : tenant.objects.ReadCursor()) {
+        for (auto object : ns.objects.ReadCursor()) {
             if (dynamic_replication_.PendingExpiredLocked(object.state(),
                                                           now_ms)) {
                 expired.push_back(object.ref());
             }
         }
         for (const auto& object : expired) {
-            auto hold = tenant.objects.Write(object);
+            auto hold = ns.objects.Write(object);
             if (!hold) {
                 continue;
             }
@@ -8663,10 +8662,10 @@ void MasterService::EvictionThreadFunc() {
             {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
-                tenants_.Visit([&](const TenantId& tenant_id,
-                                   metadata::Tenant& tenant) {
-                    DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
-                });
+                namespaces_.Visit(
+                    [&](const TenantId& tenant_id, metadata::Namespace& ns) {
+                        DiscardExpiredProcessingReplicas(ns, tenant_id, now);
+                    });
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
@@ -8716,7 +8715,7 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    metadata::Tenant& tenant, const TenantId& tenant_id,
+    metadata::Namespace& ns, const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
@@ -8725,10 +8724,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // all; each key is then resolved again under its own lock, so the sweep
     // acts on the object the key holds now. Two keys of one tenant are never
     // held at once.
-    const auto keys = tenant.InFlightKeys();
+    const auto keys = ns.InFlightKeys();
 
     for (const auto& key : keys) {
-        auto hold = tenant.objects.Write(key);
+        auto hold = ns.objects.Write(key);
         if (!hold) {
             continue;
         }
@@ -8743,7 +8742,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             metadata.ClearPendingSoftPinIfNoViableReplica();
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, *hold, tenant_id);
+                EraseMetadata(ns, *hold, tenant_id);
             } else {
                 state.is_processing = false;
             }
@@ -8809,7 +8808,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant, *hold, tenant_id);
+                EraseMetadata(ns, *hold, tenant_id);
             } else {
                 state.is_processing = false;
             }
@@ -8817,7 +8816,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
-        auto hold = tenant.objects.Write(key);
+        auto hold = ns.objects.Write(key);
         if (!hold) {
             continue;
         }
@@ -8923,14 +8922,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
             dynamic_replication_.ClearPendingLocked(tenant_id, hold->key(), state);
         }
         if (!metadata.IsValid()) {
-            EraseMetadata(tenant, *hold, tenant_id);
+            EraseMetadata(ns, *hold, tenant_id);
         } else {
             state.replication_task.reset();
         }
     }
 
     for (const auto& key : keys) {
-        auto hold = tenant.objects.Write(key);
+        auto hold = ns.objects.Write(key);
         if (!hold) {
             continue;
         }
@@ -8954,7 +8953,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& key : keys) {
-        auto hold = tenant.objects.Write(key);
+        auto hold = ns.objects.Write(key);
         if (!hold) {
             continue;
         }
@@ -9152,8 +9151,8 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         client_ids.insert(client_id);
     }
 
-    tenants_.Visit([&](const TenantId&, metadata::Tenant& tenant) {
-        for (auto object : tenant.objects.ReadCursor()) {
+    namespaces_.Visit([&](const TenantId&, metadata::Namespace& ns) {
+        for (auto object : ns.objects.ReadCursor()) {
             for (const auto& replica : object.metadata().GetAllReplicas()) {
                 if (replica.is_local_disk_replica()) {
                     const auto owner = replica.get_local_disk_client_id();
@@ -9181,9 +9180,9 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         for (const auto& [client_id, record] : records) {
             segment_access.BindClientLiveness(client_id, record);
         }
-        tenants_.Visit([&](const TenantId&, metadata::Tenant& tenant) {
+        namespaces_.Visit([&](const TenantId&, metadata::Namespace& ns) {
             // Exclusive because the replicas below are rebound in place.
-            for (auto object : tenant.objects.WriteCursor()) {
+            for (auto object : ns.objects.WriteCursor()) {
                 object.metadata().VisitReplicas(
                     [](const Replica&) { return true; },
                     [&](Replica& replica) {
@@ -9245,14 +9244,14 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         if (!skip_cleanup) {
             auto cleanup_now = now;
-            tenants_.Visit([&](const TenantId& tenant_id,
-                               metadata::Tenant& tenant) {
+            namespaces_.Visit([&](const TenantId& tenant_id,
+                                  metadata::Namespace& ns) {
                 // The stale objects are collected first because the erase
                 // below mutates the route this walk reads. Each names its
                 // publication, so the teardown lands on the object that was
                 // inspected, never on a same-key replacement.
                 std::vector<route::ObjectRef> stale;
-                for (auto object : tenant.objects.ReadCursor()) {
+                for (auto object : ns.objects.ReadCursor()) {
                     const auto& metadata = object.metadata();
                     if (metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE) ||
                         metadata.IsLeaseExpired(cleanup_now)) {
@@ -9263,8 +9262,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 for (const auto& object : stale) {
                     // The route slot goes only while it still publishes
                     // this entry, so a same-key republish survives.
-                    if (auto hold = tenant.objects.Write(object)) {
-                        EraseMetadata(tenant, *hold, tenant_id);
+                    if (auto hold = ns.objects.Write(object)) {
+                        EraseMetadata(ns, *hold, tenant_id);
                     }
                 }
             });
@@ -9278,8 +9277,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        tenants_.Visit([&](const TenantId&, metadata::Tenant& tenant) {
-            for (auto object : tenant.objects.ReadCursor()) {
+        namespaces_.Visit([&](const TenantId&, metadata::Namespace& ns) {
+            for (auto object : ns.objects.ReadCursor()) {
                 for (const auto& replica : object.metadata().GetAllReplicas()) {
                     if (!replica.get_descriptor().is_memory_replica()) {
                         continue;
@@ -9362,11 +9361,11 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
 
     // A tenant that is not registered owns no object, so there is nothing to
     // free for it.
-    const auto found = tenants_.Lookup(normalized_tenant);
+    const auto found = namespaces_.Lookup(normalized_tenant);
     if (found == nullptr) {
         return total;
     }
-    metadata::Tenant& tenant = *found;
+    metadata::Namespace& ns = *found;
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
@@ -9378,7 +9377,7 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
     auto evict_replicas =
-        [&, this](metadata::Tenant& member_tenant, ObjectMetadata& metadata,
+        [&, this](metadata::Namespace& member_ns, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
@@ -9404,23 +9403,23 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
             : 0;
 
     auto try_evict_or_offload = [&, this](const route::WriteGuard& hold,
-                                          metadata::Tenant& member_tenant,
+                                          metadata::Namespace& member_ns,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
         const std::string& key = hold.key();
         ObjectMetadata& metadata = hold.metadata();
         route::ObjectState& state = hold.state();
         if (!offload_on_evict_) {
-            return evict_replicas(member_tenant, metadata, deferred_replicas);
+            return evict_replicas(member_ns, metadata, deferred_replicas);
         }
 
         if (has_local_disk_replica(metadata)) {
-            return evict_replicas(member_tenant, metadata, deferred_replicas);
+            return evict_replicas(member_ns, metadata, deferred_replicas);
         }
 
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
-            return evict_replicas(member_tenant, metadata, deferred_replicas);
+            return evict_replicas(member_ns, metadata, deferred_replicas);
         }
 
         bool queued = false;
@@ -9448,12 +9447,12 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         if (queued) {
             ++offload_queued_this_call;
             ++offload_deferred_count;
-            return evict_replicas(member_tenant, metadata, deferred_replicas);
+            return evict_replicas(member_ns, metadata, deferred_replicas);
         }
 
         if (offload_force_evict_) {
             ++offload_push_failed_forced;
-            return evict_replicas(member_tenant, metadata, deferred_replicas);
+            return evict_replicas(member_ns, metadata, deferred_replicas);
         }
         return uint64_t{0};
     };
@@ -9470,7 +9469,7 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         // released before EvictGroupOrObject.
         std::string group_id;
         {
-            auto hold = tenant.objects.Write(key);
+            auto hold = ns.objects.Write(key);
             if (!hold) {
                 return {};
             }
@@ -9485,7 +9484,7 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
             }
             if (!metadata.IsGrouped()) {
                 uint64_t freed =
-                    try_evict_or_offload(*hold, tenant, deferred_replicas);
+                    try_evict_or_offload(*hold, ns, deferred_replicas);
                 NamespaceEvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
@@ -9494,7 +9493,7 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
                                                normalized_tenant);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant, *hold, normalized_tenant);
+                    EraseMetadata(ns, *hold, normalized_tenant);
                 }
                 return result;
             }
@@ -9512,11 +9511,11 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         // membership is read from the tenant's own object route.
         auto evict_one_member =
             [&, this](const route::WriteGuard& member,
-                      metadata::Tenant& member_tenant) -> EvictMemberOutcome {
+                      metadata::Namespace& member_ns) -> EvictMemberOutcome {
             const std::string& member_key = member.key();
             ObjectMetadata& member_metadata = member.metadata();
             const uint64_t freed =
-                try_evict_or_offload(member, member_tenant, deferred_replicas);
+                try_evict_or_offload(member, member_ns, deferred_replicas);
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0) {
@@ -9540,9 +9539,9 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         // EvictGroupOrObject erased every member except the trigger, which is
         // this caller's to erase. Resolve it once more and drop it if the
         // eviction left it invalid.
-        if (auto hold = tenant.objects.Write(key);
+        if (auto hold = ns.objects.Write(key);
             hold && !hold->metadata().IsValid()) {
-            EraseMetadata(tenant, *hold, normalized_tenant);
+            EraseMetadata(ns, *hold, normalized_tenant);
         }
         return result;
     };
@@ -9553,7 +9552,7 @@ MasterService::EvictNamespaceMemory(const TenantId& tenant_id,
         // lock inside try_evict_group_or_object, and the pass stops as soon as
         // the target is met.
         std::vector<std::string> candidate_keys;
-        for (auto object : tenant.objects.ReadCursor()) {
+        for (auto object : ns.objects.ReadCursor()) {
             const auto& metadata = object.metadata();
             if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
@@ -9638,7 +9637,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto evict_replicas =
-        [&, this](metadata::Tenant& tenant, ObjectMetadata& metadata,
+        [&, this](metadata::Namespace& ns, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
                 return metadata.size *
@@ -9681,22 +9680,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto try_evict_or_offload =
         [&, this](
             const TenantId& tenant_id, const route::WriteGuard& hold,
-            metadata::Tenant& tenant,
+            metadata::Namespace& ns,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
         const std::string& key = hold.key();
         ObjectMetadata& metadata = hold.metadata();
         route::ObjectState& state = hold.state();
         if (enable_oplog_) {
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
         if (!offload_on_evict_) {
             // Original behavior
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -9704,7 +9703,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // flooding.
         if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
             offload_cap_forced_count++;
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
@@ -9732,7 +9731,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
 
         // PushOffloadingQueue failed. Default (data-preserving) behavior is to
@@ -9741,7 +9740,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // prevent silent data loss when the queue is unavailable.
         if (offload_force_evict_) {
             offload_push_failed_forced++;
-            return evict_replicas(tenant, metadata, deferred_replicas);
+            return evict_replicas(ns, metadata, deferred_replicas);
         }
         return 0;
     };
@@ -9829,7 +9828,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // than whatever its key holds now: a key republished since is a newer
     // object, which a later round judges on its own.
     auto try_evict_group_or_object =
-        [&, this](const TenantId& tenant_id, metadata::Tenant& tenant,
+        [&, this](const TenantId& tenant_id, metadata::Namespace& ns,
                   const route::ObjectRef& object, bool allow_soft_pinned,
                   std::vector<std::vector<Replica>>& deferred_replicas)
         -> EvictionResult {
@@ -9839,7 +9838,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // released before EvictGroupOrObject.
         std::string group_id;
         {
-            auto hold = tenant.objects.Write(object);
+            auto hold = ns.objects.Write(object);
             if (!hold) {
                 return {};
             }
@@ -9858,7 +9857,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (!submission) {
                     return {.stop_scan = true};
                 }
-                uint64_t freed = try_evict_or_offload(tenant_id, *hold, tenant,
+                uint64_t freed = try_evict_or_offload(tenant_id, *hold, ns,
                                                       deferred_replicas);
                 EvictionResult result{.freed_bytes = freed,
                                       .evicted_objects = freed > 0 ? 1 : 0};
@@ -9867,8 +9866,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                                tenant_id);
                 }
                 if (!enable_oplog_ && !metadata.IsValid()) {
-                    EraseMetadata(tenant, *hold, tenant_id,
-                                  EraseMode::kFull);
+                    EraseMetadata(ns, *hold, tenant_id, EraseMode::kFull);
                 }
                 return result;
             }
@@ -9886,7 +9884,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // membership is read from the tenant's own object route.
         auto evict_one_member =
             [&, this](const route::WriteGuard& member,
-                      metadata::Tenant& member_tenant) -> EvictMemberOutcome {
+                      metadata::Namespace& member_ns) -> EvictMemberOutcome {
             const std::string& member_key = member.key();
             ObjectMetadata& member_metadata = member.metadata();
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
@@ -9895,7 +9893,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 return {.stop_scan = true};
             }
             const uint64_t freed = try_evict_or_offload(
-                tenant_id, member, member_tenant, deferred_replicas);
+                tenant_id, member, member_ns, deferred_replicas);
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
@@ -9918,9 +9916,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // the caller's to erase. Drop it if the eviction left it invalid and it
         // is still published, so a same-key republish survives.
         if (!enable_oplog_) {
-            auto hold = tenant.objects.Write(object);
+            auto hold = ns.objects.Write(object);
             if (hold && !hold->metadata().IsValid()) {
-                EraseMetadata(tenant, *hold, tenant_id, EraseMode::kFull);
+                EraseMetadata(ns, *hold, tenant_id, EraseMode::kFull);
             }
         }
         return result;
@@ -9937,11 +9935,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // The census partitions over the tenants the registry holds right now; a
-    // tenant created while it runs joins the next one.
-    std::vector<std::pair<TenantId, metadata::Tenant*>> tenants;
-    tenants_.Visit([&](const TenantId& tenant_id, metadata::Tenant& tenant) {
-        tenants.emplace_back(tenant_id, &tenant);
+    // The census partitions over the namespaces the table holds right now;
+    // one created while it runs joins the next one.
+    std::vector<std::pair<TenantId, metadata::Namespace*>> tenants;
+    namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        tenants.emplace_back(tenant_id, &ns);
     });
 
     // ===== Phase 1: Parallel candidate census =====
@@ -9987,14 +9985,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 std::min(s_start + tenants_per_thread, tenants.size());
             for (size_t s = s_start; s < s_end; s++) {
                 const TenantId& tenant_id = tenants[s].first;
-                metadata::Tenant& tenant = *tenants[s].second;
-                DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
+                metadata::Namespace& ns = *tenants[s].second;
+                DiscardExpiredProcessingReplicas(ns, tenant_id, now);
 
                 local_object_count[t] +=
-                    static_cast<long>(tenant.objects.ObjectCount());
+                    static_cast<long>(ns.objects.ObjectCount());
                 // A candidate only names the object to consider: every
                 // eviction re-validates it under that object's own lock.
-                for (auto object : tenant.objects.ReadCursor()) {
+                for (auto object : ns.objects.ReadCursor()) {
                     const auto& metadata = object.metadata();
                     if (metadata.IsHardPinned()) continue;
                     bool has_evictable = can_evict_replicas(metadata);
@@ -10411,23 +10409,23 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     // Count every object first: the target is a share of the whole population.
     // Discarding expired processing replicas before the count keeps the count
     // and the eviction pass on the same population.
-    tenants_.Visit([&](const TenantId& tenant_id, metadata::Tenant& tenant) {
-        DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
-        object_count += static_cast<long>(tenant.objects.ObjectCount());
+    namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        DiscardExpiredProcessingReplicas(ns, tenant_id, now);
+        object_count += static_cast<long>(ns.objects.ObjectCount());
     });
     const long ideal_evict_num =
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
 
     if (ideal_evict_num > 0) {
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           metadata::Tenant& tenant) {
+        namespaces_.Visit([&](const TenantId& tenant_id,
+                              metadata::Namespace& ns) {
             if (evicted_count >= ideal_evict_num) {
                 return;
             }
             // The walk only names the objects to consider: each one is
             // checked again under its own lock below.
             std::vector<route::ObjectRef> candidates;
-            for (auto object : tenant.objects.ReadCursor()) {
+            for (auto object : ns.objects.ReadCursor()) {
                 const auto& metadata = object.metadata();
                 if (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
                     metadata.HasReplica(is_evictable_nof_replica) &&
@@ -10440,7 +10438,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                     break;
                 }
                 const std::string& key = object.key;
-                auto hold = tenant.objects.Write(object);
+                auto hold = ns.objects.Write(object);
                 if (!hold) {
                     continue;
                 }
@@ -10554,8 +10552,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 PublishKvRemovedAfterEvict(key, erased, "disk", metadata,
                                            tenant_id);
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant, *hold, tenant_id,
-                                  EraseMode::kFull);
+                    EraseMetadata(ns, *hold, tenant_id, EraseMode::kFull);
                 }
             }
         });
@@ -10957,11 +10954,12 @@ MasterService::MetadataSerializer::Serialize(
     // own payload, not by the entry key.
     packer.pack("shards");
 
-    std::vector<std::pair<TenantId, metadata::Tenant*>> tenants_with_metadata;
-    service_->tenants_.Visit(
-        [&](const TenantId& tenant_id, metadata::Tenant& tenant) {
-            if (tenant.objects.ObjectCount() > 0) {
-                tenants_with_metadata.emplace_back(tenant_id, &tenant);
+    std::vector<std::pair<TenantId, metadata::Namespace*>>
+        tenants_with_metadata;
+    service_->namespaces_.Visit(
+        [&](const TenantId& tenant_id, metadata::Namespace& ns) {
+            if (ns.objects.ObjectCount() > 0) {
+                tenants_with_metadata.emplace_back(tenant_id, &ns);
             }
         });
     // Deterministic order, so the same state serializes to the same bytes.
@@ -10972,14 +10970,14 @@ MasterService::MetadataSerializer::Serialize(
     packer.pack_map(tenants_with_metadata.size());
 
     uint32_t tenant_index = 0;
-    for (const auto& [tenant_id, tenant] : tenants_with_metadata) {
+    for (const auto& [tenant_id, ns] : tenants_with_metadata) {
         packer.pack(tenant_index++);
 
         // Independent buffer per tenant, compressed on its own.
         msgpack::sbuffer tenant_buffer;
         msgpack::packer<msgpack::sbuffer> tenant_packer(&tenant_buffer);
 
-        auto result = SerializeTenant(tenant_id, *tenant, tenant_packer);
+        auto result = SerializeTenant(tenant_id, *ns, tenant_packer);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -11182,10 +11180,10 @@ void MasterService::MetadataSerializer::Reset() {
     service_->weight_manager_.Clear();
     service_->soft_pin_deadline_index_.Clear();
     // Runs only while restoring at startup, before any request is served, so
-    // no caller still refers to a tenant.
-    service_->tenants_.Clear();
-    // Group membership and the shared leases live inside each tenant, so
-    // dropping the tenants above cleared them with it.
+    // no caller still refers to a namespace.
+    service_->namespaces_.Clear();
+    // Group membership and the shared leases live inside each namespace, so
+    // dropping the namespaces above cleared them with it.
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
         service_->discarded_replicas_.clear();
@@ -11196,7 +11194,7 @@ void MasterService::MetadataSerializer::Reset() {
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeTenant(
-    const TenantId& tenant_id, const metadata::Tenant& tenant,
+    const TenantId& tenant_id, const metadata::Namespace& ns,
     MsgpackPacker& packer) const {
     // Tenant payload: a map with one "metadata" field, whose items keep the
     // per-object layout [tenant_id, key, metadata_object].
@@ -11208,8 +11206,8 @@ MasterService::MetadataSerializer::SerializeTenant(
     // each is read again under its own lock below.
     // NOTE: the sort may be slow for a tenant that holds many objects.
     std::vector<route::ObjectRef> objects;
-    objects.reserve(tenant.objects.ObjectCount());
-    for (auto object : tenant.objects.ReadCursor()) {
+    objects.reserve(ns.objects.ObjectCount());
+    for (auto object : ns.objects.ReadCursor()) {
         objects.push_back(object.ref());
     }
     std::sort(objects.begin(), objects.end(),
@@ -11219,7 +11217,7 @@ MasterService::MetadataSerializer::SerializeTenant(
     for (const auto& object : objects) {
         // The snapshot excludes writers, so every object collected above is
         // still published; one that is not would leave the array short.
-        const auto hold = tenant.objects.Read(object);
+        const auto hold = ns.objects.Read(object);
         if (!hold) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::INTERNAL_ERROR,
@@ -11302,9 +11300,8 @@ MasterService::MetadataSerializer::DeserializeTenant(
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
-        metadata::Tenant& tenant =
-            service_->tenants_.GetOrCreateTenant(tenant_id);
-        const auto hold = tenant.objects.WriteOrCreate(key);
+        metadata::Namespace& ns = service_->namespaces_.GetOrCreate(tenant_id);
+        const auto hold = ns.objects.WriteOrCreate(key);
         if (hold.has_object()) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -12137,14 +12134,14 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     std::unordered_set<std::string> blocked_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           metadata::Tenant& tenant) {
+        namespaces_.Visit([&](const TenantId& tenant_id,
+                              metadata::Namespace& ns) {
             // The walk only narrows the keys to those with a replica on a
             // source segment: target selection takes the segment lock, which
             // the walk body must not, so each key is resolved again below and
             // judged on what it holds then.
             std::vector<std::string> keys_on_source;
-            for (auto object : tenant.objects.ReadCursor()) {
+            for (auto object : ns.objects.ReadCursor()) {
                 const auto replica_segments =
                     object.metadata().GetReplicaSegmentNames();
                 if (std::any_of(job.request.segments.begin(),
@@ -12270,12 +12267,12 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     std::unordered_set<std::string> remaining_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           metadata::Tenant& tenant) {
+        namespaces_.Visit([&](const TenantId& tenant_id,
+                              metadata::Namespace& ns) {
             // The walk reads each object as the route publishes it now, so a
             // replaced object's replicas never report a segment as drained
             // while the object holding the key still lives on it.
-            for (auto object : tenant.objects.ReadCursor()) {
+            for (auto object : ns.objects.ReadCursor()) {
                 const std::string& key = object.key();
                 const auto replica_segments =
                     object.metadata().GetReplicaSegmentNames();

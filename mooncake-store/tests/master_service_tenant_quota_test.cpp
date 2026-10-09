@@ -272,31 +272,33 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     // granted is given back as the key is released.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        metadata::Tenant& tenant = GetOrCreateTenantForTest(service, tenant_id);
-        const auto hold = tenant.objects.WriteOrCreate("quota-probe");
-        return tenant.Grow(hold, bytes);
+        metadata::Namespace& ns =
+            GetOrCreateNamespaceForTest(service, tenant_id);
+        const auto hold = ns.objects.WriteOrCreate("quota-probe");
+        return ns.Grow(hold, bytes);
     }
 
-    // The tenant for one tenant id, created through the registry's factory on
-    // first use, which hangs its quota account on it.
-    metadata::Tenant& GetOrCreateTenantForTest(MasterService& service,
-                                               const TenantId& tenant_id) {
-        return MasterServiceTestPeer(service).GetOrCreateTenant(tenant_id);
+    // The namespace for one tenant id, created through the table's factory on
+    // first use, which hangs the tenant's quota account on it.
+    metadata::Namespace& GetOrCreateNamespaceForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        return MasterServiceTestPeer(service).GetOrCreateNamespace(tenant_id);
     }
 
     // The one quota account of that tenant.
     TenantQuotaHandle GetBoundTenantQuotaHandleForTest(
         MasterService& service, const TenantId& tenant_id) {
-        (void)GetOrCreateTenantForTest(service, tenant_id);
+        (void)GetOrCreateNamespaceForTest(service, tenant_id);
         return &MasterServiceTestPeer(service).TenantQuotaAccount(tenant_id);
     }
 
     // Sweeps one tenant: its objects are its whole route, so no key is named.
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id) {
-        metadata::Tenant& tenant = GetOrCreateTenantForTest(service, tenant_id);
+        metadata::Namespace& ns =
+            GetOrCreateNamespaceForTest(service, tenant_id);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            tenant, tenant_id, std::chrono::system_clock::time_point::max());
+            ns, tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
@@ -476,19 +478,20 @@ TEST_F(MasterServiceTenantQuotaTest, RemoveOnUnknownTenantCreatesNoTenant) {
     auto removed = service.Remove("missing", unknown);
     ASSERT_FALSE(removed.has_value());
     EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
-    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(unknown), nullptr);
+    EXPECT_EQ(MasterServiceTestPeer::Namespaces(service).Lookup(unknown),
+              nullptr);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       GetOrCreateTenantIsIdempotentForOneTenantId) {
+       GetOrCreateNamespaceIsIdempotentForOneTenantId) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
 
-    metadata::Tenant& first_tenant =
-        GetOrCreateTenantForTest(service, tenant_id);
-    metadata::Tenant& second_tenant =
-        GetOrCreateTenantForTest(service, tenant_id);
+    metadata::Namespace& first_tenant =
+        GetOrCreateNamespaceForTest(service, tenant_id);
+    metadata::Namespace& second_tenant =
+        GetOrCreateNamespaceForTest(service, tenant_id);
 
     // One tenant id names one tenant, so a second lookup yields the same one.
     EXPECT_EQ(&first_tenant, &second_tenant);
@@ -511,12 +514,12 @@ TEST_F(MasterServiceTenantQuotaTest, GrowthAKeyNeverUsesIsGivenBack) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
-    metadata::Tenant& tenant = GetOrCreateTenantForTest(service, tenant_id);
+    metadata::Namespace& ns = GetOrCreateNamespaceForTest(service, tenant_id);
 
     {
         // Granted growth is charged at once...
-        const auto hold = tenant.objects.WriteOrCreate("never-published");
-        auto grown = tenant.Grow(hold, 128);
+        const auto hold = ns.objects.WriteOrCreate("never-published");
+        auto grown = ns.Grow(hold, 128);
         ASSERT_TRUE(grown.has_value()) << toString(grown.error());
         EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
     }
@@ -525,8 +528,8 @@ TEST_F(MasterServiceTenantQuotaTest, GrowthAKeyNeverUsesIsGivenBack) {
 
     // A refused growth charges nothing.
     {
-        const auto hold = tenant.objects.WriteOrCreate("never-published");
-        auto too_large = tenant.Grow(hold, UINT64_C(1) << 40);
+        const auto hold = ns.objects.WriteOrCreate("never-published");
+        auto too_large = ns.Grow(hold, UINT64_C(1) << 40);
         ASSERT_FALSE(too_large.has_value());
         EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     }

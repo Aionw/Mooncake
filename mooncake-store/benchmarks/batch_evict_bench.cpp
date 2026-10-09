@@ -172,12 +172,12 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        MasterServiceTestPeer::Tenants(service).Visit(
-            [&](const TenantId& tenant_id, metadata::Tenant& tenant) {
+        MasterServiceTestPeer::Namespaces(service).Visit(
+            [&](const TenantId& tenant_id, metadata::Namespace& ns) {
                 if (tenant_id != TenantId::Default()) {
                     return;
                 }
-                for (auto object : tenant.objects.WriteCursor()) {
+                for (auto object : ns.objects.WriteCursor()) {
                     auto& metadata = object.metadata();
                     {
                         SpinLocker locker(&metadata.lock);
