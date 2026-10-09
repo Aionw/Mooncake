@@ -2,6 +2,7 @@
 #include "object_test_helpers.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -19,40 +20,41 @@ namespace {
 
 // Every tenant of one registry is built through the factory it was constructed
 // with, so its tests can pass a plain one.
-std::shared_ptr<Tenant> MakeTenant(const TenantId&) {
-    return std::make_shared<Tenant>();
+std::unique_ptr<Tenant> MakeTenant(const TenantId&) {
+    return std::make_unique<Tenant>();
 }
 
-TEST(TenantRegistryTest, GetOrCreateTenantBuildsOncePerTenantId) {
+class TenantRegistryCreationTest : public ::testing::TestWithParam<TenantId> {};
+
+TEST_P(TenantRegistryCreationTest, GetOrCreateTenantBuildsOncePerTenantId) {
     size_t builds = 0;
     TenantRegistry registry([&builds](const TenantId&) {
         ++builds;
-        return std::make_shared<Tenant>();
+        return std::make_unique<Tenant>();
     });
-    const TenantId tenant("tenant-a");
+    const TenantId& tenant = GetParam();
     EXPECT_EQ(registry.Lookup(tenant), nullptr);
 
-    auto created = registry.GetOrCreateTenant(tenant);
-    ASSERT_NE(created, nullptr);
+    Tenant& created = registry.GetOrCreateTenant(tenant);
     EXPECT_EQ(builds, 1u);
-    EXPECT_EQ(registry.Lookup(tenant).get(), created.get());
+    EXPECT_EQ(registry.Lookup(tenant), &created);
 
     // A second call finds the published tenant instead of building another.
-    auto found = registry.GetOrCreateTenant(tenant);
-    EXPECT_EQ(found.get(), created.get());
+    EXPECT_EQ(&registry.GetOrCreateTenant(tenant), &created);
     EXPECT_EQ(builds, 1u);
 }
 
-TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
+TEST_P(TenantRegistryCreationTest,
+       ConcurrentCreationPublishesOneWinningTenant) {
     std::atomic<size_t> builds{0};
     TenantRegistry registry([&builds](const TenantId&) {
         builds.fetch_add(1, std::memory_order_relaxed);
-        return std::make_shared<Tenant>();
+        return std::make_unique<Tenant>();
     });
-    const TenantId tenant("tenant-race");
+    const TenantId& tenant = GetParam();
 
     constexpr int kRacers = 16;
-    std::vector<std::shared_ptr<Tenant>> observed(kRacers);
+    std::vector<Tenant*> observed(kRacers);
     std::atomic<size_t> ready{0};
     std::atomic<bool> start{false};
     std::vector<std::thread> threads;
@@ -63,7 +65,7 @@ TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            observed[i] = registry.GetOrCreateTenant(tenant);
+            observed[i] = &registry.GetOrCreateTenant(tenant);
         });
     }
     while (ready.load(std::memory_order_acquire) < kRacers) {
@@ -75,11 +77,10 @@ TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
     }
 
     for (int i = 0; i < kRacers; ++i) {
-        ASSERT_NE(observed[i], nullptr) << "racer " << i;
-        EXPECT_EQ(observed[i].get(), observed[0].get())
-            << "racer " << i << " kept a losing handle";
+        EXPECT_EQ(observed[i], observed[0])
+            << "racer " << i << " kept a losing build";
     }
-    EXPECT_EQ(registry.Lookup(tenant).get(), observed[0].get());
+    EXPECT_EQ(registry.Lookup(tenant), observed[0]);
     // Racers that missed the lookup may each build, but only one build is
     // published and every racer holds it.
     EXPECT_GE(builds.load(std::memory_order_relaxed), 1u);
@@ -87,34 +88,38 @@ TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
               static_cast<size_t>(kRacers));
 }
 
-TEST(TenantRegistryTest, RemoveDropsTheTenantButNotTheHandle) {
+// The default tenant resolves without the map lock, a named one through it;
+// both must behave the same.
+INSTANTIATE_TEST_SUITE_P(DefaultAndNamed, TenantRegistryCreationTest,
+                         ::testing::Values(TenantId::Default(),
+                                           TenantId("tenant-a")));
+
+TEST(TenantRegistryTest, ClearDropsEveryTenant) {
     TenantRegistry registry(MakeTenant);
-    ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-a")), nullptr);
-    ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-b")), nullptr);
+    Tenant& old_default = registry.GetOrCreateTenant(TenantId::Default());
+    ASSERT_NE(test::PublishObject(old_default.objects, "k1"), 0u);
+    (void)registry.GetOrCreateTenant(TenantId("tenant-a"));
 
-    // The removed handle still addresses the tenant it resolved, while the
-    // registry creates a fresh one for the same id.
-    auto removed = registry.Lookup(TenantId("tenant-a"));
-    ASSERT_NE(removed, nullptr);
-    registry.Remove(TenantId("tenant-a"));
+    registry.Clear();
+    EXPECT_EQ(registry.Lookup(TenantId::Default()), nullptr);
     EXPECT_EQ(registry.Lookup(TenantId("tenant-a")), nullptr);
-    ASSERT_NE(test::PublishObject(removed->objects, "k1"), 0u);
-    EXPECT_FALSE(removed->Empty());
+    size_t visited = 0;
+    registry.Visit([&](const TenantId&, Tenant&) { ++visited; });
+    EXPECT_EQ(visited, 0u);
 
-    auto recreated = registry.GetOrCreateTenant(TenantId("tenant-a"));
-    ASSERT_NE(recreated, nullptr);
-    EXPECT_NE(recreated.get(), removed.get());
-    EXPECT_TRUE(recreated->Empty());
-    ASSERT_NE(registry.Lookup(TenantId("tenant-b")), nullptr);
+    // The next create builds afresh, and the default is found again.
+    Tenant& new_default = registry.GetOrCreateTenant(TenantId::Default());
+    EXPECT_TRUE(new_default.Empty());
+    EXPECT_EQ(registry.Lookup(TenantId::Default()), &new_default);
 }
 
 TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
     TenantRegistry registry(MakeTenant);
-    std::vector<std::shared_ptr<Tenant>> tenants;
-    for (const auto* name : {"tenant-a", "tenant-b"}) {
-        tenants.push_back(registry.GetOrCreateTenant(TenantId(name)));
+    std::vector<Tenant*> tenants;
+    for (const TenantId& id : {TenantId::Default(), TenantId("tenant-a")}) {
+        tenants.push_back(&registry.GetOrCreateTenant(id));
     }
-    for (auto& tenant : tenants) {
+    for (Tenant* tenant : tenants) {
         ASSERT_NE(test::PublishObject(tenant->objects, "k1", "g1"), 0u);
         ASSERT_NE(test::PublishObject(tenant->objects, "k2", "g1"), 0u);
         // A restored tenant starts without membership.
@@ -123,164 +128,124 @@ TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
     }
 
     // The broadcast a snapshot restore needs: one walk reaches every tenant,
-    // and the callback receives the handle the registry publishes.
-    size_t visited = 0;
-    registry.Visit(
-        [&](const TenantId& tenant_id, const std::shared_ptr<Tenant>& tenant) {
-            EXPECT_NE(tenant, nullptr) << tenant_id.value();
-            ++visited;
-            tenant->objects.RebuildGroupState();
-        });
+    // the default one included.
+    std::vector<Tenant*> visited;
+    registry.Visit([&](const TenantId& tenant_id, Tenant& tenant) {
+        EXPECT_EQ(registry.Lookup(tenant_id), &tenant) << tenant_id.value();
+        visited.push_back(&tenant);
+        tenant.objects.RebuildGroupState();
+    });
 
-    EXPECT_EQ(visited, tenants.size());
-    for (const auto& tenant : tenants) {
+    std::sort(visited.begin(), visited.end());
+    std::sort(tenants.begin(), tenants.end());
+    EXPECT_EQ(visited, tenants);
+    for (const Tenant* tenant : tenants) {
         EXPECT_EQ(tenant->objects.GroupMembers("g1").size(), 2u);
     }
 }
 
 TEST(TenantRegistryTest, VisitWalksTheTenantsPresentWhenItStarted) {
     TenantRegistry registry(MakeTenant);
-    ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-a")), nullptr);
-    ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-b")), nullptr);
+    (void)registry.GetOrCreateTenant(TenantId("tenant-a"));
+    (void)registry.GetOrCreateTenant(TenantId("tenant-b"));
 
-    // Creating and removing tenants from inside the walk is allowed and must
-    // not change what that walk sees: it iterates the tenants present when it
-    // started, not the registry's current ones.
+    // Creating a tenant from inside the walk is allowed and must not change
+    // what that walk sees: it iterates the tenants present when it started.
     std::vector<std::string> seen;
-    bool published = false;
-    registry.Visit(
-        [&](const TenantId& tenant_id, const std::shared_ptr<Tenant>& tenant) {
-            seen.push_back(tenant_id.value());
-            EXPECT_NE(tenant, nullptr);
-            if (!published) {
-                published = true;
-                EXPECT_NE(registry.GetOrCreateTenant(TenantId("tenant-c")),
-                          nullptr);
-                registry.Remove(TenantId("tenant-a"));
-            }
-        });
-
+    registry.Visit([&](const TenantId& tenant_id, Tenant&) {
+        seen.push_back(tenant_id.value());
+        (void)registry.GetOrCreateTenant(TenantId("tenant-c"));
+    });
     EXPECT_EQ(seen.size(), 2u);
-    EXPECT_NE(std::find(seen.begin(), seen.end(), "tenant-a"), seen.end());
-    EXPECT_NE(std::find(seen.begin(), seen.end(), "tenant-b"), seen.end());
     EXPECT_EQ(std::find(seen.begin(), seen.end(), "tenant-c"), seen.end());
 
-    // The next walk sees the changes.
+    // The next walk sees it.
     std::vector<std::string> after;
-    registry.Visit(
-        [&](const TenantId& tenant_id, const std::shared_ptr<Tenant>&) {
-            after.push_back(tenant_id.value());
-        });
-    ASSERT_EQ(after.size(), 2u);
-    EXPECT_NE(std::find(after.begin(), after.end(), "tenant-b"), after.end());
+    registry.Visit([&](const TenantId& tenant_id, Tenant&) {
+        after.push_back(tenant_id.value());
+    });
+    EXPECT_EQ(after.size(), 3u);
     EXPECT_NE(std::find(after.begin(), after.end(), "tenant-c"), after.end());
 }
 
-TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
+TEST(TenantRegistryTest, ConcurrentLookupCreateAndVisitStayConsistent) {
     // Every tenant this registry builds arrives with one object already
     // inserted, so a reader that finds a tenant without it saw the tenant
     // published before it had finished being built.
     TenantRegistry registry([](const TenantId&) {
-        auto tenant = std::make_shared<Tenant>();
+        auto tenant = std::make_unique<Tenant>();
         [[maybe_unused]] const route::Generation generation =
             test::PublishObject(tenant->objects, "k1");
         assert(generation != 0);
         return tenant;
     });
     const std::vector<TenantId> ids = {
-        TenantId("tenant-a"), TenantId("tenant-b"), TenantId("tenant-c"),
-        TenantId("tenant-d")};
-    constexpr int kRemoverRounds = 20000;
-    // The other threads yield between rounds: std::shared_mutex prefers
-    // readers on glibc, and readers that never pause starve the removers on a
-    // machine with few cores. The caps only guard against a hang.
-    constexpr uint64_t kOtherRounds = 200000;
-    constexpr uint64_t kWalks = 20000;
+        TenantId::Default(), TenantId("tenant-a"), TenantId("tenant-b"),
+        TenantId("tenant-c")};
+    constexpr uint64_t kRounds = 20000;
 
-    std::atomic<bool> removers_done{false};
+    // Once found, a tenant stays where it was: every thread must keep finding
+    // the address first published for its id.
+    std::array<std::atomic<Tenant*>, 4> published{};
     std::atomic<int> violations{0};
-    std::atomic<uint64_t> walks{0};
-    const auto violation = [&] {
-        violations.fetch_add(1, std::memory_order_relaxed);
-    };
-    const auto whole = [](const std::shared_ptr<Tenant>& tenant) {
-        return tenant != nullptr && tenant->objects.ObjectCount() == 1;
+    const auto check = [&](size_t index, const Tenant* tenant) {
+        if (tenant == nullptr) {
+            return;
+        }
+        Tenant* expected = nullptr;
+        if (!published[index].compare_exchange_strong(
+                expected, const_cast<Tenant*>(tenant)) &&
+            expected != tenant) {
+            violations.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (tenant->objects.ObjectCount() != 1) {
+            violations.fetch_add(1, std::memory_order_relaxed);
+        }
     };
 
     std::vector<std::thread> threads;
-    // Removers first, so the others can stop when they are done.
-    for (int r = 0; r < 2; ++r) {
-        threads.emplace_back([&, r] {
-            for (int round = 0; round < kRemoverRounds; ++round) {
-                registry.Remove(ids[(round + r) % ids.size()]);
-            }
-        });
-    }
     for (int c = 0; c < 2; ++c) {
         threads.emplace_back([&, c] {
-            for (uint64_t i = c; i < kOtherRounds &&
-                                 !removers_done.load(std::memory_order_relaxed);
-                 ++i) {
-                std::this_thread::yield();
-                if (!whole(registry.GetOrCreateTenant(ids[i % ids.size()]))) {
-                    violation();
-                }
+            for (uint64_t i = c; i < kRounds; ++i) {
+                const size_t index = i % ids.size();
+                check(index, &registry.GetOrCreateTenant(ids[index]));
             }
         });
     }
     for (int l = 0; l < 4; ++l) {
         threads.emplace_back([&, l] {
-            for (uint64_t i = l; i < kOtherRounds &&
-                                 !removers_done.load(std::memory_order_relaxed);
-                 ++i) {
-                std::this_thread::yield();
-                const auto tenant = registry.Lookup(ids[i % ids.size()]);
-                if (tenant != nullptr && !whole(tenant)) {
-                    violation();
-                }
+            for (uint64_t i = l; i < kRounds; ++i) {
+                const size_t index = i % ids.size();
+                check(index, registry.Lookup(ids[index]));
             }
         });
     }
-    // A walker creates and removes tenants from inside its own callback, which
-    // must neither deadlock nor disturb the walk it is part of.
+    // A walker creates tenants from inside its own callback, which must
+    // neither deadlock nor disturb the walk it is part of.
     threads.emplace_back([&] {
-        uint64_t calls = 0;
-        for (uint64_t walk = 0;
-             walk < kWalks && !removers_done.load(std::memory_order_relaxed);
-             ++walk) {
-            std::this_thread::yield();
+        for (uint64_t walk = 0; walk < kRounds / 10; ++walk) {
             std::vector<std::string> seen;
-            registry.Visit([&](const TenantId& tenant_id,
-                               const std::shared_ptr<Tenant>& tenant) {
+            registry.Visit([&](const TenantId& tenant_id, Tenant& tenant) {
+                const size_t index =
+                    std::find(ids.begin(), ids.end(), tenant_id) - ids.begin();
                 if (std::find(seen.begin(), seen.end(), tenant_id.value()) !=
-                        seen.end() ||
-                    !whole(tenant)) {
-                    violation();
+                    seen.end()) {
+                    violations.fetch_add(1, std::memory_order_relaxed);
                 }
                 seen.push_back(tenant_id.value());
-                const auto& other = ids[++calls % ids.size()];
-                if (calls % 2 == 0) {
-                    (void)registry.GetOrCreateTenant(other);
-                } else {
-                    registry.Remove(other);
-                }
+                check(index, &tenant);
+                (void)registry.GetOrCreateTenant(ids[walk % ids.size()]);
             });
-            walks.fetch_add(1, std::memory_order_relaxed);
         }
     });
-
-    threads[0].join();
-    threads[1].join();
-    removers_done.store(true, std::memory_order_relaxed);
-    for (size_t t = 2; t < threads.size(); ++t) {
-        threads[t].join();
+    for (auto& thread : threads) {
+        thread.join();
     }
 
     EXPECT_EQ(violations.load(), 0);
-    EXPECT_GT(walks.load(), 0u);
-    for (const auto& tenant_id : ids) {
-        const auto tenant = registry.Lookup(tenant_id);
-        EXPECT_TRUE(tenant == nullptr || whole(tenant)) << tenant_id.value();
+    for (size_t index = 0; index < ids.size(); ++index) {
+        EXPECT_EQ(registry.Lookup(ids[index]), published[index].load())
+            << ids[index].value();
     }
 }
 

@@ -235,13 +235,13 @@ class DynamicReplicationTest : public ::testing::Test {
     // The expired-processing sweep works one tenant's whole route, so it needs
     // no key.
     void DiscardExpiredProcessingReplicas(MasterService& service) const {
-        auto tenant_handle =
+        auto* tenant =
             MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
-        if (tenant_handle == nullptr) {
+        if (tenant == nullptr) {
             return;
         }
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            tenant_handle, TenantId::Default(),
+            *tenant, TenantId::Default(),
             std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 

@@ -781,9 +781,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         MasterServiceTestPeer::Tenants(*service).Visit(
-            [&](const TenantId&,
-                const std::shared_ptr<metadata::Tenant>& handle) {
-                for (auto object : handle->objects.ReadCursor()) {
+            [&](const TenantId&, metadata::Tenant& handle) {
+                for (auto object : handle.objects.ReadCursor()) {
                     const auto& metadata = object.metadata();
                     for (const auto& replica : metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {

@@ -486,10 +486,8 @@ class MasterServiceTest : public ::testing::Test {
         // Drops every grouped object's membership from its tenant's group
         // index, leaving the group table empty for a rebuild.
         MasterServiceTestPeer::Tenants(service).Visit(
-            [&](const TenantId&,
-                const std::shared_ptr<metadata::Tenant>& handle) {
-                test::ObjectRouteTestPeer::DropGroupMemberships(
-                    handle->objects);
+            [&](const TenantId&, metadata::Tenant& handle) {
+                test::ObjectRouteTestPeer::DropGroupMemberships(handle.objects);
             });
     }
 

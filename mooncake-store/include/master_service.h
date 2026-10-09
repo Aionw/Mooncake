@@ -1063,9 +1063,8 @@ class MasterService {
         std::string user_key;
     };
 
-    // Tenant registry: one tenant per registered tenant id, each owning its
-    // object route, group table and quota account. A lookup copies the handle
-    // out, and that handle keeps the tenant alive for the caller.
+    // Tenant registry: one tenant per tenant id written to, each owning its
+    // object route; a tenant stays put once created (see TenantRegistry).
     metadata::TenantRegistry tenants_;
 
     // Weight revisions: one backend on the service, and every weight RPC
@@ -1138,7 +1137,7 @@ class MasterService {
     // ClearInvalidHandles sweeps those. With HA and the oplog on, both are
     // cleaned through the oplog. False when it tore the object down.
     [[nodiscard]] bool CleanupInvalidMemoryReplicas(
-        const TenantId& tenant_id, const std::shared_ptr<metadata::Tenant>& tenant,
+        const TenantId& tenant_id, metadata::Tenant& tenant,
         const route::WriteGuard& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
@@ -1173,9 +1172,8 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key,
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
-        const std::function<EvictMemberOutcome(const route::WriteGuard&,
-                                               const std::shared_ptr<metadata::Tenant>&)>&
-            evict_one_member);
+        const std::function<EvictMemberOutcome(
+            const route::WriteGuard&, metadata::Tenant&)>& evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     // How an erase is published to KV-event subscribers: as the object's
@@ -1192,9 +1190,8 @@ class MasterService {
     // eraser does not release its refcounts, quota charges and KV removal
     // events again. Returns whether this call tore it down.
     [[nodiscard]] bool EraseMetadata(
-        const std::shared_ptr<metadata::Tenant>& tenant,
-        const route::WriteGuard& hold, const TenantId& tenant_id,
-        EraseMode erase_mode = EraseMode::kFull,
+        metadata::Tenant& tenant, const route::WriteGuard& hold,
+        const TenantId& tenant_id, EraseMode erase_mode = EraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
     // object itself.
@@ -1293,9 +1290,9 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     // Publishes a new object under the key `hold` holds, which must hold none.
-    auto InsertMetadata(const std::shared_ptr<metadata::Tenant>& tenant,
-                        const route::WriteGuard& hold, const UUID& client_id,
-                        uint64_t value_length, const ReplicateConfig& config,
+    auto InsertMetadata(metadata::Tenant& tenant, const route::WriteGuard& hold,
+                        const UUID& client_id, uint64_t value_length,
+                        const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
@@ -1308,7 +1305,7 @@ class MasterService {
     // the key `hold` holds, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        const std::shared_ptr<metadata::Tenant>& tenant, const route::WriteGuard& hold,
+        metadata::Tenant& tenant, const route::WriteGuard& hold,
         const UUID& client_id, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1323,7 +1320,7 @@ class MasterService {
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
-        const std::shared_ptr<metadata::Tenant>& tenant, const TenantId& tenant_id,
+        metadata::Tenant& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1473,8 +1470,8 @@ class MasterService {
                            CreateKey)
             : service_(service),
               object_id_(std::move(object_id)),
-              tenant_(service_->tenants_.GetOrCreateTenant(
-                  object_id_.tenant_id)),
+              tenant_(
+                  &service_->tenants_.GetOrCreateTenant(object_id_.tenant_id)),
               hold_(tenant_->objects.WriteOrCreate(object_id_.user_key)) {
             CleanUp();
         }
@@ -1496,10 +1493,7 @@ class MasterService {
             return IsPublished() && hold_->state().replication_task.has_value();
         }
 
-        metadata::Tenant& GetTenant() { return *tenant_; }
-        const std::shared_ptr<metadata::Tenant>& GetTenantHandle() const {
-            return tenant_;
-        }
+        metadata::Tenant& GetTenant() const { return *tenant_; }
         const std::string& GetKey() const { return object_id_.user_key; }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return hold_->ref(); }
@@ -1521,9 +1515,9 @@ class MasterService {
         }
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            (void)service_->EraseMetadata(tenant_, *hold_, object_id_.tenant_id,
-                                          EraseMode::kFull,
-                                          previous_media_hint);
+            (void)service_->EraseMetadata(
+                *tenant_, *hold_, object_id_.tenant_id, EraseMode::kFull,
+                previous_media_hint);
         }
 
         void EraseFromProcessing() { hold_->state().is_processing = false; }
@@ -1535,13 +1529,13 @@ class MasterService {
         void CleanUp() {
             if (IsPublished()) {
                 (void)service_->CleanupInvalidMemoryReplicas(
-                    object_id_.tenant_id, tenant_, *hold_);
+                    object_id_.tenant_id, *tenant_, *hold_);
             }
         }
 
         MasterService* service_;
         ObjectIdentity object_id_;
-        std::shared_ptr<metadata::Tenant> tenant_;
+        metadata::Tenant* tenant_;
         std::optional<route::WriteGuard> hold_;
     };
 
@@ -1624,7 +1618,7 @@ class MasterService {
 
        private:
         const ObjectIdentity object_id_;
-        std::shared_ptr<metadata::Tenant> tenant_;
+        metadata::Tenant* tenant_;
         std::optional<route::ReadGuard> hold_;
     };
 

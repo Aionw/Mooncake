@@ -173,12 +173,11 @@ class BatchEvictBench {
         size_t ordinal = 0;
 
         MasterServiceTestPeer::Tenants(service).Visit(
-            [&](const TenantId& tenant_id,
-                const std::shared_ptr<metadata::Tenant>& tenant) {
+            [&](const TenantId& tenant_id, metadata::Tenant& tenant) {
                 if (tenant_id != TenantId::Default()) {
                     return;
                 }
-                for (auto object : tenant->objects.WriteCursor()) {
+                for (auto object : tenant.objects.WriteCursor()) {
                     auto& metadata = object.metadata();
                     {
                         SpinLocker locker(&metadata.lock);

@@ -391,7 +391,7 @@ class MasterServiceTestPeer {
         const MasterServiceConfig& config);
 
     void DiscardExpiredProcessingReplicas(
-        const std::shared_ptr<metadata::Tenant>& tenant, const TenantId& tenant_id,
+        metadata::Tenant& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
         service_.DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
     }
@@ -445,7 +445,7 @@ class MasterServiceTestPeer {
     // Resolves the tenant, creating it through the registry's factory on first
     // use; the factory hangs the namespace policy's attachment (the tenant's
     // quota account) on it. The id is taken as given.
-    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandle(const TenantId& tenant_id) {
+    metadata::Tenant& GetOrCreateTenant(const TenantId& tenant_id) {
         return service_.tenants_.GetOrCreateTenant(tenant_id);
     }
 
