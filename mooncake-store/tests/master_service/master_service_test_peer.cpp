@@ -117,26 +117,16 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     const TenantId& tenant_id, const std::string& key, const UUID& holder_id,
     ReplicaID alloc_id, uint64_t object_size) {
     auto tenant_handle = service_.tenants_.GetOrCreateTenant(tenant_id);
-    auto entry = tenant_handle->Get(key);
-    if (entry == nullptr) {
-        // The route is what keeps the entry reachable by the completion path,
-        // so an unpublished key is seeded through InsertObject.
-        entry = std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
+    // The route is what keeps the object reachable by the completion path, so
+    // an absent key is seeded with a publication of its own.
+    const auto hold = tenant_handle->objects.WriteOrCreate(key);
+    if (!hold.has_object()) {
+        hold.Publish(std::make_unique<ObjectMetadata>(
             holder_id, std::chrono::system_clock::now(), object_size,
             std::vector<Replica>{}, std::nullopt, false,
             ObjectDataType::UNKNOWN, std::string{}, tenant_id, key));
-        // The insert is the seeding step itself, so it stays outside the
-        // assert, which a release build compiles out.
-        const bool inserted = tenant_handle->InsertObject(entry);
-        assert(inserted);
-        (void)inserted;
     }
-    auto hold = tenant_handle->WriteHold(entry);
-    assert(hold.has_value());
-    if (!hold) {
-        return;
-    }
-    hold->state().promotion_task =
+    hold.state().promotion_task =
         PromotionTask{.source_id = 0,
                       .alloc_id = alloc_id,
                       .object_size = object_size,
@@ -155,22 +145,16 @@ size_t MasterServiceTestPeer::CountCandidatesForTesting(
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     // The index only names keys, so each key is resolved again under its own
-    // entry lock; a key whose entry was replaced in between is skipped.
+    // lock; a key that holds no object any more is skipped.
     service_.tenants_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<metadata::Tenant>& handle) {
             for (const auto& key :
                  service_.promotion_candidates_.Keys(tenant_id)) {
-                auto entry = handle->Get(key);
-                if (entry == nullptr) {
-                    continue;
+                auto hold = handle->objects.Write(key);
+                if (hold && hold->state().promotion_candidate.has_value()) {
+                    hold->state().promotion_candidate->retry_after = epoch;
                 }
-                test::ObjectEntryTestPeer::WithExclusiveAccess(
-                    *entry, [&](ObjectMetadata&, ObjectEntry::State& state) {
-                        if (state.promotion_candidate.has_value()) {
-                            state.promotion_candidate->retry_after = epoch;
-                        }
-                    });
             }
         });
 }

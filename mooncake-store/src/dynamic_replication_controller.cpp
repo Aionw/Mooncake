@@ -455,10 +455,10 @@ void DynamicReplicationController::EraseExpiredLeases(
     it->second.EraseExpired(now);
 }
 
-// --- Per-entry pending state ------------------------------------------------
+// --- Per-object pending state ------------------------------------------------
 
 tl::expected<void, ErrorCode> DynamicReplicationController::CheckCooldownLocked(
-    ObjectEntry::State& state) const {
+    route::ObjectState& state) const {
     if (state.dynamic_replication_cooldown ==
         std::chrono::steady_clock::time_point{}) {
         return {};
@@ -472,7 +472,7 @@ tl::expected<void, ErrorCode> DynamicReplicationController::CheckCooldownLocked(
 }
 
 ReplicaActionLease DynamicReplicationController::IssueLeaseLocked(
-    ObjectEntry::State& state, const TenantId& tenant_id,
+    route::ObjectState& state, const TenantId& tenant_id,
     const std::string& key, const ReplicaActionProposal& proposal,
     const Plan& plan, uint64_t version_epoch, int64_t now_ms) {
     const int64_t server_deadline_ms = now_ms + kLeaseTtl.count();
@@ -505,11 +505,11 @@ ReplicaActionLease DynamicReplicationController::IssueLeaseLocked(
 }
 
 void DynamicReplicationController::CommitLeaseLocked(
-    ObjectEntry::State& state, const TenantId& tenant_id,
-    const ObjectEntry& entry, const ReplicaActionLease& lease) {
+    route::ObjectState& state, const TenantId& tenant_id,
+    const std::string& key, const ReplicaActionLease& lease) {
     assert(state.dynamic_replication_pending.has_value());
-    // A lease is filed under the key of the entry that names its publication.
-    assert(lease.key == entry.key());
+    // A lease is filed under the key of the object it was issued for.
+    assert(lease.key == key);
     state.dynamic_replication_pending->task_id = lease.task_id;
     state.dynamic_replication_cooldown =
         std::chrono::steady_clock::now() + kActionCooldown;
@@ -518,36 +518,36 @@ void DynamicReplicationController::CommitLeaseLocked(
 }
 
 bool DynamicReplicationController::PendingExpiredLocked(
-    const ObjectEntry::State& state, int64_t now_ms) const {
+    const route::ObjectState& state, int64_t now_ms) const {
     return state.dynamic_replication_pending.has_value() &&
            state.dynamic_replication_pending->expire_at_ms_epoch < now_ms;
 }
 
 bool DynamicReplicationController::HasPendingLocked(const TenantId& tenant_id,
-                                                    const ObjectEntry& entry,
-                                                    ObjectEntry::State& state) {
+                                                    const std::string& key,
+                                                    route::ObjectState& state) {
     if (!state.dynamic_replication_pending.has_value()) {
         return false;
     }
     if (!PendingExpiredLocked(state, NowMs())) {
         return true;
     }
-    ClearPendingLocked(tenant_id, entry, state);
+    ClearPendingLocked(tenant_id, key, state);
     return false;
 }
 
 void DynamicReplicationController::ClearPendingLocked(
-    const TenantId& tenant_id, const ObjectEntry& entry,
-    ObjectEntry::State& state) {
+    const TenantId& tenant_id, const std::string& key,
+    route::ObjectState& state) {
     state.dynamic_replication_pending.reset();
     state.dynamic_replication_cooldown =
         std::chrono::steady_clock::time_point{};
-    EraseLeasesForObject(tenant_id, entry.key());
+    EraseLeasesForObject(tenant_id, key);
 }
 
 tl::expected<void, ErrorCode>
 DynamicReplicationController::ValidateCopyStartLocked(
-    ObjectEntry::State& state, const UUID& lease_id,
+    route::ObjectState& state, const UUID& lease_id,
     const std::string& source_segment, uint64_t current_version_epoch,
     uint64_t lease_version_epoch,
     const std::vector<std::string>& target_segments) const {
@@ -597,7 +597,7 @@ DynamicReplicationController::ValidateCopyStartLocked(
 }
 
 void DynamicReplicationController::RegisterCopyStartLocked(
-    ObjectMetadata& metadata, ObjectEntry::State& state,
+    ObjectMetadata& metadata, route::ObjectState& state,
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) const {

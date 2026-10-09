@@ -178,7 +178,7 @@ class BatchEvictBench {
                 if (tenant_id != TenantId::Default()) {
                     return;
                 }
-                for (auto object : tenant->WriteCursor()) {
+                for (auto object : tenant->objects.WriteCursor()) {
                     auto& metadata = object.metadata();
                     {
                         SpinLocker locker(&metadata.lock);

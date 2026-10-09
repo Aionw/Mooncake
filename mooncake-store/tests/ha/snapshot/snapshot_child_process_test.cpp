@@ -580,7 +580,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         auto handle =
             MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
-        return handle != nullptr && handle->ContainsObject(key);
+        return handle != nullptr && handle->objects.Contains(key);
     }
 
     size_t SoftPinRegistrationCount(MasterService* svc) {
@@ -608,7 +608,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             service_.get(),
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
-        return accessor.GetEntry() != nullptr && accessor.Get().IsGrouped();
+        return accessor.IsPublished() && accessor.Get().IsGrouped();
     }
 
    private:

@@ -5,14 +5,18 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "object_entry.h"
 #include "object_metadata.h"
+#include "route/object_route.h"
 
 namespace mooncake {
 namespace test {
@@ -30,25 +34,62 @@ inline std::unique_ptr<ObjectMetadata> MakeObjectMetadata(
         false, ObjectDataType::UNKNOWN, group_id, TenantId(), user_key);
 }
 
-// The same envelope inside the per-object shell the route stores.
-inline std::shared_ptr<ObjectEntry> MakeObjectEntry(
-    const std::string& key, const std::string& group_id = {}) {
-    return std::make_shared<ObjectEntry>(MakeObjectMetadata(key, group_id));
+// Publishes that envelope under `key` and returns its generation, or 0 when
+// the key already holds an object (the route never hands out generation 0).
+inline route::Generation PublishObject(route::ObjectRoute& route,
+                                       const std::string& key,
+                                       const std::string& group_id = {}) {
+    auto guard = route.WriteOrCreate(key);
+    if (guard.has_object()) {
+        return 0;
+    }
+    return guard.Publish(MakeObjectMetadata(key, group_id));
 }
 
-// Reaches an entry's own lock directly, beneath the tenant that otherwise
-// owns every access to a published entry: for the suites of the layers below
-// it (ObjectEntry, ObjectIndex), and for a test that holds an entry busy from
-// another thread or inspects one the tenant no longer hands out, such as one
-// already torn down.
-struct ObjectEntryTestPeer {
-    template <typename Fn>
-    static decltype(auto) WithExclusiveAccess(ObjectEntry& entry, Fn&& fn) {
-        return entry.WithExclusiveAccess(std::forward<Fn>(fn));
+// Reaches beneath the route's public surface: for the route's own suite,
+// which counts slots and keeps one referenced, and for fixtures that need a
+// restored route's state, such as a group table that starts empty.
+struct ObjectRouteTestPeer {
+    // Every slot in the stripes, whether or not it holds an object.
+    static size_t SlotCount(const route::ObjectRoute& route) {
+        size_t count = 0;
+        for (const auto& stripe : route.stripes_) {
+            std::shared_lock<std::shared_mutex> lock(stripe.lock);
+            count += stripe.slots.size();
+        }
+        return count;
     }
-    template <typename Fn>
-    static decltype(auto) WithSharedAccess(const ObjectEntry& entry, Fn&& fn) {
-        return entry.WithSharedAccess(std::forward<Fn>(fn));
+
+    // A strong reference to `key`'s slot, or null when the route has none.
+    // Holding it keeps an empty slot from being collected.
+    static std::shared_ptr<route::KeySlot> SlotRef(
+        const route::ObjectRoute& route, std::string_view key) {
+        return route.FindSlot(key);
+    }
+
+    // Drops every grouped object's membership from the group index, leaving
+    // the objects (and the leases their metadata holds) as they are: the
+    // state a restore starts from before RebuildGroupState(). The slots are
+    // gathered under the stripe locks and locked only after those are let go,
+    // since nothing waits for a slot lock while holding a stripe.
+    static void DropGroupMemberships(route::ObjectRoute& route) {
+        std::vector<std::shared_ptr<route::KeySlot>> slots;
+        for (const auto& stripe : route.stripes_) {
+            std::shared_lock<std::shared_mutex> lock(stripe.lock);
+            for (const auto& entry : stripe.slots) {
+                slots.push_back(entry.second);
+            }
+        }
+        for (const auto& slot : slots) {
+            std::unique_lock<std::shared_mutex> lock(slot->mutex_);
+            if (!slot->record_.has_value()) {
+                continue;
+            }
+            const std::string& group_id = slot->record_->metadata->group_id;
+            if (!group_id.empty()) {
+                (void)route.groups_.RemoveMember(group_id, slot->key());
+            }
+        }
     }
 };
 

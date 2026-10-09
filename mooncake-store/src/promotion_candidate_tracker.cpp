@@ -29,17 +29,16 @@ std::vector<std::string> PromotionCandidateTracker::Keys(
     return {it->second.begin(), it->second.end()};
 }
 
-// --- Per-entry candidate ----------------------------------------------------
+// --- Per-object candidate ----------------------------------------------------
 
 void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
-                                             const ObjectEntry& entry,
-                                             ObjectEntry::State& state,
+                                             const std::string& key,
+                                             route::ObjectState& state,
                                              uint8_t sketch_score,
                                              PromotionCandidateReason reason,
                                              ErrorCode last_error,
                                              uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
-    const std::string& key = entry.key();
     if (state.promotion_candidate.has_value()) {
         // Update existing entry: refresh last_seen, reset
         // retry_after/retry_count. execution_failures is intentionally NOT
@@ -88,37 +87,37 @@ void PromotionCandidateTracker::RecordLocked(const TenantId& tenant_id,
 }
 
 void PromotionCandidateTracker::EraseLocked(const TenantId& tenant_id,
-                                            const ObjectEntry& entry,
-                                            ObjectEntry::State& state) {
+                                            const std::string& key,
+                                            route::ObjectState& state) {
     if (!state.promotion_candidate.has_value()) {
         return;
     }
     state.promotion_candidate.reset();
-    Unindex(tenant_id, entry.key());
+    Unindex(tenant_id, key);
     DecrementCount();
 }
 
 uint32_t PromotionCandidateTracker::ConsumeLocked(const TenantId& tenant_id,
-                                                  const ObjectEntry& entry,
-                                                  ObjectEntry::State& state) {
+                                                  const std::string& key,
+                                                  route::ObjectState& state) {
     if (!state.promotion_candidate.has_value()) {
         return 0;
     }
     const uint32_t execution_failures =
         state.promotion_candidate->execution_failures;
-    EraseLocked(tenant_id, entry, state);
+    EraseLocked(tenant_id, key, state);
     return execution_failures;
 }
 
 bool PromotionCandidateTracker::DueLocked(
-    const TenantId& tenant_id, const ObjectEntry& entry,
-    ObjectEntry::State& state, std::chrono::steady_clock::time_point now) {
+    const TenantId& tenant_id, const std::string& key,
+    route::ObjectState& state, std::chrono::steady_clock::time_point now) {
     if (!state.promotion_candidate.has_value()) {
         return false;
     }
     const PromotionCandidate& candidate = *state.promotion_candidate;
     if (Stale(candidate, now)) {
-        VLOG(1) << "promotion_candidate_expired key=" << entry.key()
+        VLOG(1) << "promotion_candidate_expired key=" << key
                 << " retry_count=" << candidate.retry_count;
         // retry_count == 0: the TTL elapsed before the scheduler reached it,
         // so the scan budget was too small. retry_count > 0: it gave up after
@@ -130,15 +129,15 @@ bool PromotionCandidateTracker::DueLocked(
             MasterMetricManager::instance()
                 .inc_promotion_candidate_expired_evaluated();
         }
-        EraseLocked(tenant_id, entry, state);
+        EraseLocked(tenant_id, key, state);
         return false;
     }
     return candidate.retry_after <= now;
 }
 
 void PromotionCandidateTracker::BackoffLocked(const TenantId& tenant_id,
-                                              const ObjectEntry& entry,
-                                              ObjectEntry::State& state,
+                                              const std::string& key,
+                                              route::ObjectState& state,
                                               PromotionQueueResult result) {
     if (!state.promotion_candidate.has_value()) {
         return;
@@ -157,9 +156,9 @@ void PromotionCandidateTracker::BackoffLocked(const TenantId& tenant_id,
     }
 
     if (Stale(candidate, now)) {
-        VLOG(1) << "promotion_candidate_gave_up key=" << entry.key()
+        VLOG(1) << "promotion_candidate_gave_up key=" << key
                 << " retries=" << candidate.retry_count;
-        EraseLocked(tenant_id, entry, state);
+        EraseLocked(tenant_id, key, state);
         MasterMetricManager::instance()
             .inc_promotion_candidate_expired_evaluated();
     } else {

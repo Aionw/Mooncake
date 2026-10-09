@@ -807,19 +807,18 @@ TEST_F(MasterServiceTest,
         // Hold one seeded object's entry open: the bucket that holds it cannot
         // be validated while this lock is held, so the writers below meet a
         // full allocator the way a slow eviction validation leaves it.
-        const auto blocked_entry = MasterServiceTestPeer::FindObject(
-            service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
-                                                           old_keys.front()});
-        ASSERT_NE(blocked_entry, nullptr);
+        const MasterServiceTestPeer::ObjectIdentity blocked_object{
+            TenantId::Default(), old_keys.front()};
+        ASSERT_TRUE(
+            MasterServiceTestPeer::FindObject(service, blocked_object)
+                .has_value());
         std::atomic<bool> release_blocked_entry{false};
         std::thread blocker([&] {
-            test::ObjectEntryTestPeer::WithExclusiveAccess(
-                *blocked_entry, [&](ObjectMetadata&, ObjectEntry::State&) {
-                    while (!release_blocked_entry.load()) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(1));
-                    }
-                });
+            auto hold =
+                MasterServiceTestPeer::WriteObject(service, blocked_object);
+            while (!release_blocked_entry.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         });
         std::barrier start_barrier(kConcurrentWrites + 1);
         std::vector<int> errors(kConcurrentWrites,

@@ -229,7 +229,7 @@ class DynamicReplicationTest : public ::testing::Test {
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
         MasterServiceTestPeer(service).ClearDynamicReplicationStateForKey(
-            TenantId::Default(), *accessor.GetEntry(), accessor.GetState());
+            TenantId::Default(), accessor.GetKey(), accessor.GetState());
     }
 
     // The expired-processing sweep works one tenant's whole route, so it needs

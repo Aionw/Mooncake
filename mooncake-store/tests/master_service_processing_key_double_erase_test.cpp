@@ -12,12 +12,14 @@
 // ClearInvalidHandles() internally, which would erase the crafted object
 // through the sweep before PutEnd could exercise the accessor's own cleanup.
 //
-// The child asserts EraseMetadata claimed the teardown, the processing marker
-// is cleared and the route slot is gone, and reports that through its exit
+// The child asserts the publication cannot be torn down again, its in-flight
+// work went with it and the key holds no object, and reports that through its exit
 // code: a forked child turns a crash into a test failure.
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
+
+#include <algorithm>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -81,12 +83,11 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutStartFailed);
         }
 
-        // Hold the publication across its teardown, so the claim the cleanup
-        // took can still be probed once the route slot is gone.
-        auto entry = MasterServiceTestPeer::FindObject(
+        // Name the publication, so it can still be probed once torn down.
+        const auto object = MasterServiceTestPeer::FindObject(
             service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
-        if (entry == nullptr) {
+        if (!object) {
             ::_exit(kExitPutStartFailed);
         }
 
@@ -113,35 +114,25 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutEndAnswer);
         }
 
-        // A second teardown of the same entry must find the claim taken and
-        // release nothing.
+        // A second teardown of the same publication must find nothing to
+        // release: the torn-down publication is not held again.
         const auto tenant =
             MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
         if (tenant == nullptr) {
             ::_exit(kExitNotTornDown);
         }
-        // The torn-down entry is not held again, so no second teardown runs.
-        bool released_again = false;
-        auto hold = tenant->WriteHold(entry);
-        const bool torn_down_again =
-            hold.has_value() &&
-            tenant->TearDownObject(*hold, [&] { released_again = true; });
-        hold.reset();
-        if (torn_down_again || released_again) {
+        if (tenant->objects.Write(*object).has_value()) {
             ::_exit(kExitNotTornDown);
         }
-        const bool still_processing =
-            test::ObjectEntryTestPeer::WithSharedAccess(
-                *entry,
-                [](const ObjectMetadata&, const ObjectEntry::State& state) {
-                    return state.is_processing;
-                });
-        if (still_processing) {
+        // Its in-flight work went with it.
+        const auto in_flight = tenant->InFlightKeys();
+        if (std::find(in_flight.begin(), in_flight.end(), key) !=
+            in_flight.end()) {
             ::_exit(kExitStillProcessing);
         }
         if (MasterServiceTestPeer::FindObject(
                 service, MasterServiceTestPeer::ObjectIdentity{
-                             TenantId::Default(), key}) != nullptr) {
+                             TenantId::Default(), key})) {
             ::_exit(kExitStillRouted);
         }
 
@@ -174,7 +165,8 @@ TEST_F(MasterServiceProcessingKeyDoubleEraseTest,
                << WTERMSIG(status)
                << (WTERMSIG(status) == SIGSEGV ? " (SIGSEGV)" : "")
                << ". One publication must be torn down at most once; "
-                  "Tenant::TearDownObject is what claims it.";
+                  "a teardown under the key's lock leaves nothing to tear "
+                  "down again.";
     }
     ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally";
     EXPECT_EQ(WEXITSTATUS(status), kExitOk)

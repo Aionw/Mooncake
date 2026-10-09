@@ -5,11 +5,11 @@
 //
 // The controller owns the heat windows, the admission queue and the thread
 // draining it, and the per-tenant lease tables. It owns no object: the pending
-// record of a key lives on ObjectEntry::State next to its replication task, so
-// both are guarded by the entry's own lock. The *Locked methods apply the rules
-// to a state whose entry lock the caller already holds.
+// record of a key lives on route::ObjectState next to its replication task, so
+// both are guarded by the key's lock. The *Locked methods apply the rules
+// to a state whose key lock the caller already holds.
 //
-// Lock order: entry lock -> lease lock. The heat lock and the queue lock are
+// Lock order: key lock -> lease lock. The heat lock and the queue lock are
 // leaves, and the admission thread takes neither while it submits.
 
 #include <atomic>
@@ -33,7 +33,7 @@
 
 #include "client_liveness.h"
 #include "dynamic_replication_lease_table.h"
-#include "object_entry.h"
+#include "route/object_route.h"
 #include "object_metadata.h"
 #include "rpc_types.h"
 #include "segment.h"
@@ -124,15 +124,15 @@ class DynamicReplicationController {
     void EraseExpiredLeases(const TenantId& tenant_id,
                             std::chrono::system_clock::time_point now);
 
-    // --- Per-entry pending state; the caller holds the entry lock ----------
+    // --- Per-object pending state; the caller holds the key lock ----------
 
-    // UNAVAILABLE_IN_CURRENT_STATUS while the entry is cooling down from its
+    // UNAVAILABLE_IN_CURRENT_STATUS while the object is cooling down from its
     // last action; an elapsed cooldown is cleared.
     tl::expected<void, ErrorCode> CheckCooldownLocked(
-        ObjectEntry::State& state) const;
-    // Issues the lease for `plan` and records it as the entry's pending task,
+        route::ObjectState& state) const;
+    // Issues the lease for `plan` and records it as the object's pending task,
     // still without a task id.
-    ReplicaActionLease IssueLeaseLocked(ObjectEntry::State& state,
+    ReplicaActionLease IssueLeaseLocked(route::ObjectState& state,
                                         const TenantId& tenant_id,
                                         const std::string& key,
                                         const ReplicaActionProposal& proposal,
@@ -140,23 +140,23 @@ class DynamicReplicationController {
                                         uint64_t version_epoch, int64_t now_ms);
     // Binds the submitted task to the pending record, starts the cooldown and
     // files the lease.
-    void CommitLeaseLocked(ObjectEntry::State& state, const TenantId& tenant_id,
-                           const ObjectEntry& entry,
+    void CommitLeaseLocked(route::ObjectState& state, const TenantId& tenant_id,
+                           const std::string& key,
                            const ReplicaActionLease& lease);
     // Whether a task is still pending; an expired one is cleared.
-    bool HasPendingLocked(const TenantId& tenant_id, const ObjectEntry& entry,
-                          ObjectEntry::State& state);
-    bool PendingExpiredLocked(const ObjectEntry::State& state,
+    bool HasPendingLocked(const TenantId& tenant_id, const std::string& key,
+                          route::ObjectState& state);
+    bool PendingExpiredLocked(const route::ObjectState& state,
                               int64_t now_ms) const;
     // Drops the pending task, the cooldown and the leases of the key.
-    void ClearPendingLocked(const TenantId& tenant_id, const ObjectEntry& entry,
-                            ObjectEntry::State& state);
+    void ClearPendingLocked(const TenantId& tenant_id, const std::string& key,
+                            route::ObjectState& state);
     // Checks a CopyStart against the pending task. A plain copy passes only
     // when no task is pending; a dynamic copy only for the pending task's own
     // lease, epoch, source and target. Which client owns the source segment is
     // left to the caller.
     tl::expected<void, ErrorCode> ValidateCopyStartLocked(
-        ObjectEntry::State& state, const UUID& lease_id,
+        route::ObjectState& state, const UUID& lease_id,
         const std::string& source_segment, uint64_t current_version_epoch,
         uint64_t lease_version_epoch,
         const std::vector<std::string>& target_segments) const;
@@ -168,16 +168,16 @@ class DynamicReplicationController {
     class PendingCopyGuard {
        public:
         PendingCopyGuard(DynamicReplicationController& controller,
-                         const TenantId& tenant_id, const ObjectEntry& entry,
-                         ObjectEntry::State& state, bool active)
+                         const TenantId& tenant_id, const std::string& key,
+                         route::ObjectState& state, bool active)
             : controller_(controller),
               tenant_id_(tenant_id),
-              entry_(entry),
+              key_(key),
               state_(state),
               active_(active) {}
         ~PendingCopyGuard() {
             if (active_) {
-                controller_.ClearPendingLocked(tenant_id_, entry_, state_);
+                controller_.ClearPendingLocked(tenant_id_, key_, state_);
             }
         }
         PendingCopyGuard(const PendingCopyGuard&) = delete;
@@ -189,13 +189,13 @@ class DynamicReplicationController {
        private:
         DynamicReplicationController& controller_;
         const TenantId& tenant_id_;
-        const ObjectEntry& entry_;
-        ObjectEntry::State& state_;
+        const std::string& key_;
+        route::ObjectState& state_;
         bool active_;
     };
     // Consumes the pending task at CopyStart, marking the replica it adds.
     void RegisterCopyStartLocked(
-        ObjectMetadata& metadata, ObjectEntry::State& state,
+        ObjectMetadata& metadata, route::ObjectState& state,
         const std::string& source_segment, uint64_t version_epoch,
         const std::vector<std::string>& target_segments,
         const std::vector<ReplicaID>& replica_ids) const;

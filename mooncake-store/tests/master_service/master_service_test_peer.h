@@ -30,8 +30,6 @@ class MasterServiceTestPeer {
         DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
-    static constexpr auto kObjectOperationLockStripes =
-        MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -165,14 +163,30 @@ class MasterServiceTestPeer {
         return service.tenants_;
     }
 
-    // The entry the tenant of `object_id` routes for its key, or nullptr when
-    // that tenant is absent or the key is not routed. The tenant id is resolved
-    // as for a request. The handle is strong, so the entry outlives the
-    // lookup; its metadata is read under the entry's own lock.
-    static std::shared_ptr<ObjectEntry> FindObject(
+    // The publication the tenant of `object_id` holds under its key, or
+    // nullopt when that tenant is absent or the key holds no object.
+    static std::optional<route::ObjectRef> FindObject(
+        MasterService& service, const ObjectIdentity& object_id) {
+        auto hold = ReadObject(service, object_id);
+        return hold ? std::optional<route::ObjectRef>(hold->ref())
+                    : std::nullopt;
+    }
+
+    // The object under `object_id`, held shared or exclusively for the
+    // caller's scope the way a request path holds it; nullopt when that
+    // tenant is absent or the key holds no object. A test parks a path that
+    // must take the key by keeping the write guard.
+    static std::optional<route::ReadGuard> ReadObject(
         MasterService& service, const ObjectIdentity& object_id) {
         auto tenant = service.tenants_.Lookup(object_id.tenant_id);
-        return tenant == nullptr ? nullptr : tenant->Get(object_id.user_key);
+        return tenant == nullptr ? std::nullopt
+                                 : tenant->objects.Read(object_id.user_key);
+    }
+    static std::optional<route::WriteGuard> WriteObject(
+        MasterService& service, const ObjectIdentity& object_id) {
+        auto tenant = service.tenants_.Lookup(object_id.tenant_id);
+        return tenant == nullptr ? std::nullopt
+                                 : tenant->objects.Write(object_id.user_key);
     }
 
     // A replica-action lease is recorded per tenant and keyed by proposal id,
@@ -195,13 +209,6 @@ class MasterServiceTestPeer {
     }
     static const auto& NofSegmentManager(const MasterService& service) {
         return service.nof_segment_manager_;
-    }
-
-    static auto& ObjectOperationLocks(MasterService& service) {
-        return service.object_operation_locks_;
-    }
-    static const auto& ObjectOperationLocks(const MasterService& service) {
-        return service.object_operation_locks_;
     }
 
     static auto& OrderedOplogWriter(MasterService& service) {
@@ -362,12 +369,11 @@ class MasterServiceTestPeer {
 
     void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
 
-    // The caller holds the entry exclusively, as through MetadataAccessorRW.
+    // The caller holds the key exclusively, as through MetadataAccessorRW.
     void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
-                                            const ObjectEntry& entry,
-                                            ObjectEntry::State& state) {
-        service_.dynamic_replication_.ClearPendingLocked(tenant_id, entry,
-                                                         state);
+                                            const std::string& key,
+                                            route::ObjectState& state) {
+        service_.dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     }
 
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -417,10 +423,10 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
-        std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl) {
         service_.FinalizeExpiredProcessingReplicasAfterDurable(
-            std::move(entry), durable_entry, ttl);
+            std::move(object), durable_entry, ttl);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
@@ -503,16 +509,15 @@ class MasterServiceTestPeer {
         return service_.TryPushPromotionQueue(object_id, record_candidate);
     }
 
-    // Runs `fn` while the entry's own lock is held, the way a mutating path
-    // holds it. A test parks a path that must take this entry by blocking
-    // inside `fn`.
+    // Runs `fn` while the key's lock is held, the way a mutating path holds
+    // it. A test parks a path that must take this key by blocking inside
+    // `fn`.
     template <typename Fn>
     void WithEntryLockedForTesting(const TenantId& tenant_id,
                                    const std::string& key, Fn&& fn) {
-        auto entry = FindObject(service_, ObjectIdentity{tenant_id, key});
-        assert(entry != nullptr);
-        test::ObjectEntryTestPeer::WithExclusiveAccess(
-            *entry, [&](ObjectMetadata&, ObjectEntry::State&) { fn(); });
+        auto hold = WriteObject(service_, ObjectIdentity{tenant_id, key});
+        assert(hold.has_value());
+        fn();
     }
 
    private:

@@ -281,26 +281,33 @@ TEST_F(MasterServiceTest, GroupedRoutingIsDecoupledFromGroupMembership) {
     auto tenant_handle =
         MasterServiceTestPeer::Tenants(*service_).Lookup(tenant);
     ASSERT_NE(nullptr, tenant_handle);
-    EXPECT_EQ(3u, tenant_handle->ObjectCount());
+    EXPECT_EQ(3u, tenant_handle->objects.ObjectCount());
     for (const auto& key : {key_a, key_b, survivor_key}) {
-        EXPECT_NE(
-            nullptr,
+        EXPECT_TRUE(
             MasterServiceTestPeer::FindObject(
-                *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key}))
+                *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key})
+                .has_value())
             << "key=" << key;
     }
-    auto grouped_entry = MasterServiceTestPeer::FindObject(
-        *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key_a});
-    ASSERT_NE(nullptr, grouped_entry);
-    EXPECT_EQ(group_id, grouped_entry->group_id());
-    auto grouped_peer = MasterServiceTestPeer::FindObject(
-        *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key_b});
-    ASSERT_NE(nullptr, grouped_peer);
-    EXPECT_EQ(group_id, grouped_peer->group_id());
-    auto ungrouped_entry = MasterServiceTestPeer::FindObject(
-        *service_, MasterServiceTestPeer::ObjectIdentity{tenant, survivor_key});
-    ASSERT_NE(nullptr, ungrouped_entry);
-    EXPECT_TRUE(ungrouped_entry->group_id().empty());
+    {
+        auto grouped = MasterServiceTestPeer::ReadObject(
+            *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key_a});
+        ASSERT_TRUE(grouped.has_value());
+        EXPECT_EQ(group_id, grouped->metadata().group_id);
+    }
+    {
+        auto grouped_peer = MasterServiceTestPeer::ReadObject(
+            *service_, MasterServiceTestPeer::ObjectIdentity{tenant, key_b});
+        ASSERT_TRUE(grouped_peer.has_value());
+        EXPECT_EQ(group_id, grouped_peer->metadata().group_id);
+    }
+    {
+        auto ungrouped = MasterServiceTestPeer::ReadObject(
+            *service_,
+            MasterServiceTestPeer::ObjectIdentity{tenant, survivor_key});
+        ASSERT_TRUE(ungrouped.has_value());
+        EXPECT_TRUE(ungrouped->metadata().group_id.empty());
+    }
 
     // Read paths reach both members by (tenant, key), not through the group.
     EXPECT_TRUE(service_->ExistKey(key_a, tenant).value_or(false));

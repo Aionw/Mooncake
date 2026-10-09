@@ -303,15 +303,15 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
-        auto object_entry = MasterServiceTestPeer::FindObject(
+        auto object = MasterServiceTestPeer::FindObject(
             service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        ASSERT_NE(object_entry, nullptr);
+        ASSERT_TRUE(object.has_value());
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                object_entry, entry, std::chrono::system_clock::now());
+                *object, entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,

@@ -1,345 +1,102 @@
 #pragma once
 
-// Tenant: one tenant's object route, the lifecycle of its groups and the list
-// of its objects with work in flight. Quota, replica-action leases and
-// promotion candidates belong to their own subsystems, which hold their own
-// state and validate it against the entry the route publishes before acting.
+// Tenant: one tenant's object route and the list of its objects with work in
+// flight. Quota, replica-action leases and promotion candidates belong to
+// their own subsystems, which hold their own state and validate it against the
+// object the route holds before acting.
 //
-// Identity is the entry handle: an entry stands for exactly one publication, so
-// `TearDownObject` recognises an object by the handle a caller holds and drops
-// its group membership with the slot. An object is reached through `ReadHold`
-// or `WriteHold`, which re-check that identity under the entry lock; whether
-// an entry is still published is the tenant's to decide, never the caller's.
-//
-// Every method synchronizes internally. Lock order: entry lock, route lock,
-// then the group table. Only a teardown holds the route lock across the
-// group table, and nothing takes the route lock while holding a group stripe.
-// An in-flight stripe is taken under the entry lock alone and nests nothing.
+// The route (route::ObjectRoute) owns the keys, their locks, the objects and
+// the group index; the tenant only adds the in-flight list, which it keeps in
+// step with every write guard the route releases.
 
-#include <algorithm>
 #include <array>
-#include <cassert>
-#include <chrono>
-#include <cstdint>
-#include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "common/intrusive_list.h"
 #include "common/transparent_string_hash.h"
-#include "group_index.h"
-#include "object_index.h"
+#include "route/object_route.h"
 
 namespace mooncake {
 namespace metadata {
 
-class Tenant {
+class Tenant final : private route::RouteObserver {
    public:
-    // Publishes `entry` on this tenant's route. The route slot and the group
-    // lease are wired under the entry's own lock, so a reader that reaches the
-    // entry through the route cannot observe a grouped object before its group
-    // lease is in place; an entry published with work in flight joins the
-    // in-flight list as that lock is released. `on_published(hold)` then runs
-    // under the same hold, for what the publisher does first on the object it
-    // just made, before anyone else can reach it. False when the key is
-    // already routed, and then nothing was registered and nothing ran.
-    template <typename OnPublished>
-    [[nodiscard]] bool InsertObject(std::shared_ptr<ObjectEntry> entry,
-                                    OnPublished&& on_published) {
-        const std::string group_id = entry->group_id();
-        ObjectEntry::WriteHold hold(std::move(entry), &Tenant::SettleInFlight,
-                                    this);
-        if (!object_index_.Insert(hold.handle())) {
-            return false;
-        }
-        if (!group_id.empty()) {
-            // AddMember returns null only for an empty group_id, which the
-            // guard above already excluded.
-            hold.metadata().lease_ =
-                group_index_.AddMember(group_id, hold.key());
-            assert(hold.metadata().lease_ != nullptr);
-        }
-        std::forward<OnPublished>(on_published)(hold);
-        return true;
-    }
-    [[nodiscard]] bool InsertObject(std::shared_ptr<ObjectEntry> entry) {
-        return InsertObject(std::move(entry),
-                            [](const ObjectEntry::WriteHold&) {});
-    }
+    Tenant() : objects(this) {}
+    Tenant(const Tenant&) = delete;
+    Tenant& operator=(const Tenant&) = delete;
 
-    // Null when the key is absent.
-    [[nodiscard]] std::shared_ptr<ObjectEntry> Get(std::string_view key) const {
-        return object_index_.Get(key);
-    }
-
-    // Ends the publication the hold names, at most once: claims the teardown,
-    // runs `release()`, then drops the route slot and the group membership.
-    // `release` gives back what hangs off the object (refcounts, quota
-    // charges, KV removal events) while the slot is still held, so a newer
-    // publication of the same key cannot land before it. Since the claim and
-    // the removal share the hold, a routed entry is never torn down. The entry
-    // leaves the in-flight list with its slot, whatever work it still carries.
-    // False, running nothing, when it was already torn down under this hold.
-    template <typename Release>
-    [[nodiscard]] bool TearDownObject(const ObjectEntry::WriteHold& hold,
-                                      Release&& release) {
-        ObjectEntry::State& state = hold.state();
-        if (state.is_torn_down) {
-            return false;
-        }
-        state.is_torn_down = true;
-        std::forward<Release>(release)();
-        SyncInFlight(hold);
-        RemoveObject(hold.handle());
-        return true;
-    }
-
-    // Holds the entry the route currently publishes for `key` under its read
-    // or write lock, for the caller's scope. The hold is made only once it has
-    // re-checked under that lock that the route still publishes this entry;
-    // nullopt otherwise, so a caller never acts on an entry torn down or
-    // replaced in between.
-    //
-    // The entry lock is not recursive: while a hold lives, the caller must not
-    // reach the same entry through any accessor here again.
-    //
-    // Work started or finished under a write hold is put on or taken off the
-    // tenant's in-flight list as the hold is released, so the caller has
-    // nothing to track.
-    [[nodiscard]] std::optional<ObjectEntry::ReadHold> ReadHold(
-        std::string_view key) const {
-        return HoldIfPublished<LockMode::kRead>(object_index_.Get(key),
-                                                nullptr);
-    }
-    [[nodiscard]] std::optional<ObjectEntry::WriteHold> WriteHold(
-        std::string_view key) {
-        return HoldIfPublished<LockMode::kWrite>(object_index_.Get(key), this);
-    }
-
-    // The same for a handle the caller already has, from this tenant: the
-    // hold is made only while the route still publishes this very entry,
-    // never a newer publication of its key.
-    [[nodiscard]] std::optional<ObjectEntry::ReadHold> ReadHold(
-        std::shared_ptr<ObjectEntry> entry) const {
-        return HoldIfPublished<LockMode::kRead>(std::move(entry), nullptr);
-    }
-    [[nodiscard]] std::optional<ObjectEntry::WriteHold> WriteHold(
-        std::shared_ptr<ObjectEntry> entry) {
-        return HoldIfPublished<LockMode::kWrite>(std::move(entry), this);
-    }
-
-    [[nodiscard]] bool ContainsObject(std::string_view key) const {
-        return object_index_.Contains(key);
-    }
-
-    [[nodiscard]] size_t ObjectCount() const {
-        return object_index_.ObjectCount();
-    }
-
-    // A cursor over every published object, each under its own read or write
-    // lock; see ObjectIndex::ReadCursor for what the loop body may do. An
-    // object it visits is the current publication of its key, so the body
-    // needs no route check; one that acts after the cursor keeps `handle()`
-    // and goes through `WriteHold` like any other handle.
-    [[nodiscard]] ObjectIndex::Cursor<LockMode::kRead> ReadCursor() const {
-        return object_index_.ReadCursor();
-    }
-    [[nodiscard]] ObjectIndex::Cursor<LockMode::kWrite> WriteCursor() {
-        return object_index_.WriteCursor();
-    }
+    route::ObjectRoute objects;
 
     // True when the tenant holds no object and no group membership.
-    [[nodiscard]] bool Empty() const {
-        return object_index_.Empty() && group_index_.Empty();
-    }
-
-    // Drops a grouped entry's membership, without touching the route slot;
-    // `RemoveObject` calls it as one step of a teardown, and rebuilding
-    // membership state calls it on its own. The group and the key
-    // come from the entry. Callers must have established that this entry is the
-    // one the route publishes, which is what keeps a teardown from dropping the
-    // membership a newer publication of the same key registered.
-    void UnregisterGroupMember(const std::shared_ptr<ObjectEntry>& entry) {
-        const std::string& group_id = entry->group_id();
-        if (group_id.empty()) {
-            return;
-        }
-        (void)group_index_.RemoveMember(group_id, entry->key());
-    }
-
-    // The member keys of one group, as a snapshot to re-resolve: a group can be
-    // dropped and rebuilt while a caller walks the list, so a key in it may
-    // resolve to a different object than the one that registered it, or to
-    // none. Callers that act on the members, eviction among them, read each key
-    // again and check what they find rather than treating the list and the
-    // handles as one consistent view.
-    [[nodiscard]] std::vector<std::string> GroupMembers(
-        std::string_view group_id) const {
-        return group_index_.Members(group_id);
-    }
-
-    // Rebuilds group membership and the group leases from object metadata, for
-    // the snapshot and standby restore paths. The first pass takes the maximum
-    // restored deadline per group, so a grouped object is not left on a
-    // zero-deadline lease that post-restore cleanup would drop; the second
-    // registers membership and points every grouped entry at the group's shared
-    // lease. Ungrouped objects keep the lease they were constructed with.
-    void RebuildGroupState() {
-        std::unordered_map<std::string, std::chrono::system_clock::time_point>
-            max_deadline_by_group;
-        for (auto object : object_index_.ReadCursor()) {
-            const ObjectMetadata& metadata = object.metadata();
-            if (!metadata.IsGrouped()) {
-                continue;
-            }
-            const auto deadline = metadata.EvictionDeadline();
-            auto [it, inserted] =
-                max_deadline_by_group.try_emplace(metadata.group_id, deadline);
-            if (!inserted) {
-                it->second = std::max(it->second, deadline);
-            }
-        }
-        // The group index is below the route in the lock order, so the cursor's
-        // loop body registers membership itself.
-        for (auto object : object_index_.WriteCursor()) {
-            const std::string& group_id = object.metadata().group_id;
-            if (group_id.empty()) {
-                continue;
-            }
-            auto lease = group_index_.AddMember(group_id, object.key());
-            // A non-empty group_id always yields a lease, as in InsertObject.
-            assert(lease != nullptr);
-            const auto it = max_deadline_by_group.find(group_id);
-            if (it != max_deadline_by_group.end()) {
-                lease->ExtendTo(it->second);
-            }
-            object.metadata().lease_ = std::move(lease);
-        }
-    }
+    [[nodiscard]] bool Empty() const { return objects.Empty(); }
 
     // --- Work in flight ------------------------------------------------------
     //
-    // The tenant lists the entries that carry work in flight (see
-    // ObjectEntry::State::HasInFlightWork), so a sweep for expired work walks
+    // The tenant lists the keys whose object carries work in flight (see
+    // route::ObjectState::HasInFlightWork), so a sweep for expired work walks
     // those instead of every object. Work only starts or finishes under a write
-    // hold, and every write hold the tenant hands out settles the entry's place
-    // on the list as it is released: an entry is listed exactly while it is
-    // published, not torn down and carries work as of the last write hold on
-    // it. A write cursor neither starts nor finishes such work.
+    // guard, and the route reports every write guard to the tenant as it is
+    // released: a key is listed exactly while it holds an object that carries
+    // work as of the last write guard on it. A write cursor neither starts nor
+    // finishes such work.
 
-    // The keys of the listed entries, as a snapshot to resolve again: an entry
-    // can finish, be torn down or be replaced under its key once the stripe
-    // lock is released.
+    // The listed keys, as a snapshot to resolve again: an object can finish,
+    // be torn down or be replaced once the stripe lock is released.
     [[nodiscard]] std::vector<std::string> InFlightKeys() const {
         std::vector<std::string> keys;
         for (const InFlightStripe& stripe : in_flight_) {
             std::lock_guard<std::mutex> lock(stripe.lock);
-            for (const ObjectEntry& entry : stripe.entries) {
-                keys.push_back(entry.key());
+            for (const route::KeySlot& slot : stripe.slots) {
+                keys.push_back(slot.key());
             }
         }
         return keys;
     }
 
    private:
-    // Locks `entry` and keeps the hold only while the route still publishes
-    // it. No route lookup is needed for that under the entry's lock: only
-    // TearDownObject drops a route slot, and it claims the entry under that
-    // same lock first, so an entry published and not yet torn down is still
-    // the one its slot holds. A write hold settles the in-flight list on
-    // release through `owner`.
-    template <LockMode kMode>
-    [[nodiscard]] static std::optional<ObjectEntry::Hold<kMode>>
-    HoldIfPublished(std::shared_ptr<ObjectEntry> entry,
-                    [[maybe_unused]] Tenant* owner) {
-        if (entry == nullptr) {
-            return std::nullopt;
-        }
-        ObjectEntry::Hold<kMode> hold(std::move(entry));
-        if (!hold.handle()->IsPublished() || hold.state().is_torn_down) {
-            return std::nullopt;
-        }
-        if constexpr (kMode == LockMode::kWrite) {
-            hold.on_release_ = &Tenant::SettleInFlight;
-            hold.hook_context_ = owner;
-        }
-        return std::optional<ObjectEntry::Hold<kMode>>(std::move(hold));
-    }
-
-    // The release hook of the write holds this tenant hands out.
-    static void SettleInFlight(void* tenant,
-                               const ObjectEntry::WriteHold& hold) {
-        static_cast<Tenant*>(tenant)->SyncInFlight(hold);
-    }
-
-    // Puts the held entry on the in-flight list or takes it off, to match
-    // whether it is published, not torn down and carries work. The stripe
-    // lock is taken only when that changed.
-    void SyncInFlight(const ObjectEntry::WriteHold& hold) {
-        ObjectEntry& entry = *hold.handle();
-        ObjectEntry::State& state = hold.state();
-        const bool listed = entry.IsPublished() && !state.is_torn_down &&
-                            state.HasInFlightWork();
-        if (listed == state.in_flight_listed) {
+    // Puts the held key on the in-flight list or takes it off, to match
+    // whether it holds an object that carries work. The stripe lock is taken
+    // only when that changed.
+    void OnWriteRelease(const route::WriteGuard& guard) override {
+        route::SlotOwnerState& owner = guard.owner_state();
+        const bool listed =
+            guard.has_object() && guard.state().HasInFlightWork();
+        if (listed == owner.in_flight_listed) {
             return;
         }
-        InFlightStripe& stripe = InFlightStripeOf(entry.key());
+        InFlightStripe& stripe = InFlightStripeOf(guard.key());
         std::lock_guard<std::mutex> lock(stripe.lock);
         if (listed) {
-            stripe.entries.PushBack(entry);
+            stripe.slots.PushBack(guard.slot());
         } else {
-            stripe.entries.Erase(entry);
+            stripe.slots.Erase(guard.slot());
         }
-        state.in_flight_listed = listed;
+        owner.in_flight_listed = listed;
     }
 
-    // Drops the route slot and the group membership, only while the slot still
-    // holds `entry`. Both go under one hold of the route lock, because
-    // membership is keyed by the object key: once the slot is released, a
-    // newer publication of the same key can register the membership this
-    // teardown would drop.
-    void RemoveObject(const std::shared_ptr<ObjectEntry>& entry) {
-        object_index_.WithExclusiveRoute(entry->key(), [&](auto& route) {
-            const auto it = route.find(entry->key());
-            if (it == route.end() || it->second != entry) {
-                return;
-            }
-            route.erase(it);
-            UnregisterGroupMember(entry);
-        });
-    }
-
-    using InFlightList = IntrusiveList<ObjectEntry, InFlightListTag>;
+    using InFlightList = IntrusiveList<route::KeySlot, InFlightListTag>;
 
     // One stripe of the in-flight list. Starting and finishing a write each
     // touch the list, so it is striped by key, as the route is, rather than
     // put under one lock for the whole tenant.
     struct InFlightStripe {
         mutable std::mutex lock;
-        InFlightList entries;
+        InFlightList slots;
     };
 
-    static constexpr size_t kInFlightStripeCount = ObjectIndex::kStripeCount;
+    static constexpr size_t kInFlightStripeCount =
+        route::ObjectRoute::kStripeCount;
 
     InFlightStripe& InFlightStripeOf(std::string_view key) {
         return in_flight_[TransparentStringHash{}(key) % kInFlightStripeCount];
     }
 
-    // Primary object route: object key -> strong ObjectEntry handle, with the
-    // per-object mutation boundary inside the entry.
-    ObjectIndex object_index_;
-
-    // Group membership and the one shared Lease per group.
-    GroupIndex group_index_;
-
-    // The entries with work in flight. Declared after the route so it is
-    // destroyed first: the route's handles keep every listed entry alive
-    // until the list has let go of its hook.
+    // The keys with work in flight. Declared after the route so it is
+    // destroyed first: the route's slots must outlive the hooks the list
+    // holds.
     std::array<InFlightStripe, kInFlightStripeCount> in_flight_;
 };
 

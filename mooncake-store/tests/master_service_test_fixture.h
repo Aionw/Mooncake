@@ -126,17 +126,13 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant(tenant_id);
-        auto entry = MasterServiceTestPeer::FindObject(
+        auto hold = MasterServiceTestPeer::ReadObject(
             service,
             MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
-        if (entry == nullptr) {
+        if (!hold) {
             return std::nullopt;
         }
-        return test::ObjectEntryTestPeer::WithSharedAccess(
-            *entry,
-            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return metadata.GetCommittedSoftPinTimeout();
-            });
+        return hold->metadata().GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -150,15 +146,14 @@ class MasterServiceTest : public ::testing::Test {
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant(tenant_id);
-        auto entry = MasterServiceTestPeer::FindObject(
-            service,
-            MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
-        ASSERT_TRUE(entry != nullptr);
-        test::ObjectEntryTestPeer::WithExclusiveAccess(
-            *entry, [&](ObjectMetadata& metadata, ObjectEntry::State&) {
-                SpinLocker locker(&metadata.lock);
-                metadata.soft_pin_timeout = deadline;
-            });
+        {
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service,
+                MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+            ASSERT_TRUE(hold.has_value());
+            SpinLocker locker(&hold->metadata().lock);
+            hold->metadata().soft_pin_timeout = deadline;
+        }
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
     }
@@ -484,23 +479,17 @@ class MasterServiceTest : public ::testing::Test {
         if (tenant_handle == nullptr) {
             return {};
         }
-        return tenant_handle->GroupMembers(group_id);
+        return tenant_handle->objects.GroupMembers(group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        // Drops every grouped entry's membership from its tenant's group
+        // Drops every grouped object's membership from its tenant's group
         // index, leaving the group table empty for a rebuild.
         MasterServiceTestPeer::Tenants(service).Visit(
             [&](const TenantId&,
                 const std::shared_ptr<metadata::Tenant>& handle) {
-                // The group index is below the route in the lock order, so
-                // the cursor's loop body may drop memberships.
-                for (auto object : handle->ReadCursor()) {
-                    if (object.handle()->group_id().empty()) {
-                        continue;
-                    }
-                    handle->UnregisterGroupMember(object.handle());
-                }
+                test::ObjectRouteTestPeer::DropGroupMemberships(
+                    handle->objects);
             });
     }
 
@@ -519,8 +508,9 @@ class MasterServiceTest : public ::testing::Test {
         if (tenant_handle == nullptr) {
             return nullptr;
         }
-        for (const auto& member_key : tenant_handle->GroupMembers(group_id)) {
-            if (auto hold = tenant_handle->ReadHold(member_key)) {
+        for (const auto& member_key :
+             tenant_handle->objects.GroupMembers(group_id)) {
+            if (auto hold = tenant_handle->objects.Read(member_key)) {
                 return hold->metadata().lease_;
             }
         }
