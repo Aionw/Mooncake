@@ -89,7 +89,7 @@ TEST(NamespaceTest, PublishingWithWorkListsTheKeyOnRelease) {
         // The write that creates the object starts with work in flight.
         auto guard = ns.objects.WriteOrCreate("k1");
         ASSERT_FALSE(guard.has_object());
-        (void)guard.Publish(test::MakeObjectMetadata("k1"));
+        (void)test::PublishEnvelope(guard);
         guard.state().is_processing = true;
         EXPECT_TRUE(ns.InFlightKeys().empty());
     }
@@ -145,7 +145,7 @@ TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->TearDown();
-        (void)guard->Publish(test::MakeObjectMetadata("k1"));
+        (void)test::PublishEnvelope(*guard);
     }
     EXPECT_TRUE(ns.InFlightKeys().empty());
 
@@ -153,7 +153,7 @@ TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->TearDown();
-        (void)guard->Publish(test::MakeObjectMetadata("k1"));
+        (void)test::PublishEnvelope(*guard);
         guard->state().is_processing = true;
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));

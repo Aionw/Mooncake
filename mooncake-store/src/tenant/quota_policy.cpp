@@ -1,6 +1,7 @@
-#include "tenant_quota_policy.h"
+#include "tenant/quota_policy.h"
 
 #include <algorithm>
+#include <cassert>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -64,10 +65,10 @@ uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
 
 }  // namespace
 
-TenantQuotaPolicy::TenantQuotaPolicy(StoreView& store, Options options)
-    : store_(store), options_(options), manager_(/*enabled=*/true, [this] {
-          return store_.AllocatableMemoryBytes();
-      }) {}
+TenantQuotaPolicy::TenantQuotaPolicy(StoreControl& store, Options options)
+    : store_(store),
+      options_(options),
+      manager_([this] { return store_.AllocatableMemoryBytes(); }) {}
 
 void TenantQuotaPolicy::OpenPolicyStoreOrThrow(const std::string& type,
                                                const std::string& uri,
@@ -131,9 +132,10 @@ uint64_t TenantQuotaPolicy::MemoryCharge(const ObjectMetadata& metadata) {
                : static_cast<uint64_t>(charge);
 }
 
-TenantQuotaAccount* TenantQuotaPolicy::AccountOf(const PolicyContext& ctx) {
-    auto* attachment = static_cast<TenantAccount*>(ctx.attachment);
-    return attachment == nullptr ? nullptr : &attachment->account;
+TenantQuotaAccount& TenantQuotaPolicy::AccountOf(const PolicyContext& ctx) {
+    // OnNamespaceCreated hangs an account on every namespace.
+    assert(ctx.attachment != nullptr);
+    return static_cast<TenantAccount*>(ctx.attachment)->account;
 }
 
 std::unique_ptr<PolicyAttachment> TenantQuotaPolicy::OnNamespaceCreated(
@@ -152,11 +154,7 @@ TenantQuotaPolicy::AdmitWrite(const TenantId& tenant_id) {
 
 tl::expected<void, ErrorCode> TenantQuotaPolicy::OnGrow(
     const PolicyContext& ctx, uint64_t bytes) {
-    TenantQuotaAccount* account = AccountOf(ctx);
-    if (account == nullptr) {
-        return {};
-    }
-    auto charged = account->TryCharge(bytes);
+    auto charged = AccountOf(ctx).TryCharge(bytes);
     if (!charged) {
         const ErrorCode error = ToErrorCode(charged.error().error);
         if (error == ErrorCode::TENANT_QUOTA_EXCEEDED) {
@@ -173,9 +171,6 @@ tl::expected<void, ErrorCode> TenantQuotaPolicy::OnGrow(
 }
 
 void TenantQuotaPolicy::OnReplace(const PolicyContext& ctx) {
-    if (AccountOf(ctx) == nullptr) {
-        return;
-    }
     // The replaced object's charge, and whatever it still carried from an
     // earlier replacement, is owed until the replacement's write settles.
     Carried(ctx) =
@@ -189,10 +184,7 @@ void TenantQuotaPolicy::OnTearDown(const PolicyContext& ctx) {
 }
 
 void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
-    TenantQuotaAccount* account = AccountOf(ctx);
-    if (account == nullptr) {
-        return;
-    }
+    TenantQuotaAccount& account = AccountOf(ctx);
     uint64_t& held = Held(ctx);
     uint64_t& carried = Carried(ctx);
     uint64_t owed = 0;
@@ -209,9 +201,9 @@ void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
         // Growth the core did not ask for up front, such as a write that
         // completed more than it reserved: charged regardless of the quota,
         // since the memory is already in use.
-        account->ChargeUnchecked(owed - held);
+        account.ChargeUnchecked(owed - held);
     } else if (owed < held) {
-        if (!account->Release(held - owed)) {
+        if (!account.Release(held - owed)) {
             LOG(ERROR) << "tenant quota release mismatch, tenant="
                        << ctx.tenant_id << ", key=" << ctx.guard.key()
                        << ", bytes=" << held - owed;
@@ -220,16 +212,12 @@ void TenantQuotaPolicy::OnWriteRelease(const PolicyContext& ctx) {
     held = owed;
 }
 
-void TenantQuotaPolicy::OnRestored(StoreView& store) {
+void TenantQuotaPolicy::OnRestored() {
     // No write is in flight, so every key's words and every account can be set
     // to what the restored objects owe.
     TenantQuotaUsageMap usage;
-    store.VisitNamespaces([&](const TenantId& tenant_id,
-                              PolicyAttachment* attachment,
-                              route::ObjectRoute& route) {
-        if (attachment == nullptr) {
-            return;
-        }
+    store_.VisitNamespaces([&](const TenantId& tenant_id,
+                               route::ObjectRoute& route) {
         uint64_t charged_bytes = 0;
         for (auto object : route.WriteCursor()) {
             const uint64_t charge = MemoryCharge(object.metadata());
@@ -245,12 +233,9 @@ void TenantQuotaPolicy::OnRestored(StoreView& store) {
     manager_.RebuildUsageOrThrow(usage);
 }
 
-void TenantQuotaPolicy::OnCapacityChanged(StoreView& store) {
-    (void)store;
-    manager_.Recompute();
-}
+void TenantQuotaPolicy::OnCapacityChanged() { manager_.Recompute(); }
 
-void TenantQuotaPolicy::OnMaintenance(StoreControl& store) {
+void TenantQuotaPolicy::OnMaintenance() {
     if (options_.eviction_high_watermark_ratio <= 0.0) {
         return;
     }
@@ -294,7 +279,7 @@ void TenantQuotaPolicy::OnMaintenance(StoreControl& store) {
                 << " target_ratio=" << target_ratio
                 << " target_bytes=" << target_bytes;
         const auto result =
-            store.EvictNamespaceMemory(snapshot.tenant_id, target_bytes);
+            store_.EvictNamespaceMemory(snapshot.tenant_id, target_bytes);
         VLOG(1) << "[TENANT-EVICT-DONE] tenant=" << snapshot.tenant_id
                 << " freed_bytes=" << result.freed_bytes
                 << " evicted_objects=" << result.evicted_objects;

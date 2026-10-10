@@ -241,8 +241,7 @@ class DynamicReplicationTest : public ::testing::Test {
             return;
         }
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *ns, TenantId::Default(),
-            std::chrono::system_clock::now() + std::chrono::seconds(1));
+            *ns, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 
     bool ObserveDynamicReplicationAccess(MasterService& service,

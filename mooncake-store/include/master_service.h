@@ -38,12 +38,12 @@
 #include "metadata/namespace.h"
 #include "metadata/namespace_table.h"
 #include "mutex.h"
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 #include "promotion_candidate_tracker.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "metadata/namespace_policy.h"
-#include "tenant_quota_policy.h"
+#include "tenant/quota_policy.h"
 #include "types.h"
 #include "weight_store_manager.h"
 #include "master_config.h"
@@ -108,12 +108,12 @@ class MasterServiceTestPeer;
  * 5. the tenant quota policy's recompute lock
  * 6. the quota table's shard locks or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex and everything an object operation reaches
- *    from the key lock: the tenant's group index and in-flight list, the
- *    lease table of dynamic_replication_ and the key index of
- *    promotion_candidates_, the OpLog
- *    writer's mutex, local_ssd_manager_, dfs_allocator_,
- *    discarded_replicas_mutex_ and ObjectMetadata's own spin lock. These are
- *    leaves: none of them is held while a lock above is taken.
+ *    from the key lock: the tenant's group index, in-flight list and eviction
+ *    index, the lease table of dynamic_replication_ and the key index of
+ *    promotion_candidates_, the OpLog writer's mutex, local_ssd_manager_,
+ *    dfs_allocator_, discarded_replicas_mutex_ and ObjectMetadata's own spin
+ *    lock. These are leaves: none of them is held while a lock above is
+ *    taken.
  *
  * A route's own stripe locks are outside this order: the route holds one only
  * to find, create or collect a key's lock, or across a cursor that only tries
@@ -996,21 +996,17 @@ class MasterService {
     tl::expected<void, SerializationError> ApplySnapshotState(
         const std::chrono::system_clock::time_point& now);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
+    // One pool-wide round of memory eviction (see eviction::Evictor), after
+    // the housekeeping that frees expired writes and deferred releases. It
+    // consumes the allocation-pressure signal and raises it again when the
+    // round could free nothing that was there to free.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
-    // Evicts memory replicas of one namespace's objects, oldest lease first,
-    // until `target_bytes` are freed or nothing more qualifies; what a policy
-    // asks for through StoreControl.
+    // Evicts memory replicas of one namespace's objects until `target_bytes`
+    // are freed or nothing more qualifies (see eviction::Evictor); what a
+    // policy asks for through StoreControl.
     NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
                                                  uint64_t target_bytes);
 
@@ -1021,6 +1017,17 @@ class MasterService {
                                      const std::string& key,
                                      const TenantId& tenant_id,
                                      Replica& replica)
+        -> tl::expected<bool, ErrorCode>;
+    // Registers `replica`, `client_id`'s completed LOCAL_DISK replica, on the
+    // published object `metadata` under the caller's write hold of the key:
+    // added when the object has no completed local-disk replica, otherwise
+    // the client's own one takes its endpoint and size. The OpLog records the
+    // object as it will be before anything changes; an OpLog error leaves it
+    // untouched. Returns whether a replica was added.
+    auto AttachLocalDiskReplica(const TenantId& tenant_id,
+                                const std::string& key,
+                                ObjectMetadata& metadata,
+                                const UUID& client_id, Replica& replica)
         -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
@@ -1135,45 +1142,14 @@ class MasterService {
     // left. Only memory replicas are checked: a local_disk handle needs
     // client_mutex_, which must be taken before any object lock, so
     // ClearInvalidHandles sweeps those. With HA and the oplog on, both are
-    // cleaned through the oplog. False when it tore the object down.
-    [[nodiscard]] bool CleanupInvalidMemoryReplicas(
-        const TenantId& tenant_id, metadata::Namespace& ns,
-        const route::WriteGuard& hold);
+    // cleaned through the oplog.
+    void CleanupInvalidMemoryReplicas(metadata::Namespace& ns,
+                                      const route::WriteGuard& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
     // table; empty if the tenant or the group is unregistered.
     std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const;
-
-    // A single group member's eviction outcome, fed back by the
-    // EvictGroupOrObject callback.
-    struct EvictMemberOutcome {
-        uint64_t freed_bytes{0};
-        long evicted_objects{0};
-        bool stop_scan{false};
-        ErrorCode error{ErrorCode::OK};
-    };
-    // Aggregated outcome of a group eviction.
-    struct GroupEvictionResult {
-        uint64_t freed_bytes{0};
-        long evicted_objects{0};
-        bool stop_scan{false};
-        ErrorCode error{ErrorCode::OK};
-    };
-
-    // Evicts every member of `group_id` from the tenant's group table, or the
-    // single `key` when that group is empty. Members are re-resolved under
-    // their own key's lock, since the list is a snapshot; those that no longer
-    // qualify are skipped. `evict_one_member` does the path-specific eviction
-    // and may erase other members, the trigger `key` is the caller's to erase,
-    // and members left invalid are torn down here. Callers hold no per-object
-    // lock.
-    GroupEvictionResult EvictGroupOrObject(
-        const TenantId& tenant_id, const std::string& key,
-        const std::string& group_id, bool allow_soft_pinned,
-        std::chrono::system_clock::time_point now,
-        const std::function<EvictMemberOutcome(
-            const route::WriteGuard&, metadata::Namespace&)>& evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     // How an erase is published to KV-event subscribers: as the object's
@@ -1187,11 +1163,10 @@ class MasterService {
     // Erases the object `hold` holds and every record that hangs off its key,
     // under that key's lock, so the checks that led here stay atomic with the
     // teardown. A key whose object is already gone is left alone, so a second
-    // eraser does not release its refcounts, quota charges and KV removal
-    // events again. Returns whether this call tore it down.
-    [[nodiscard]] bool EraseMetadata(
+    // eraser does not release its refcounts and KV removal events again.
+    void EraseMetadata(
         metadata::Namespace& ns, const route::WriteGuard& hold,
-        const TenantId& tenant_id, EraseMode erase_mode = EraseMode::kFull,
+        EraseMode erase_mode = EraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
     // object itself.
@@ -1199,10 +1174,6 @@ class MasterService {
         const route::WriteGuard& hold, const TenantId& tenant_id,
         EraseMode erase_mode,
         const std::vector<std::string>& previous_media_hint);
-    // The memory a write of `value_length` bytes under `config` asks the
-    // namespace policy for before it allocates.
-    uint64_t RequestedMemoryGrowth(uint64_t value_length,
-                                   const ReplicateConfig& config) const;
     // The memory every segment mounted on this service adds up to,
     // saturating at the 64-bit range; what tenant quotas are carved from.
     uint64_t AllocatableMemoryBytes();
@@ -1244,6 +1215,27 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
+    // Removes the object under HA with the oplog on: marks its completed
+    // replicas removed and queues a REMOVE whose durable callback drops them,
+    // and the object with them.
+    tl::expected<void, ErrorCode> MarkRemovedAndPersist(
+        const TenantId& tenant_id, const std::string& key,
+        ObjectMetadata& metadata);
+    struct RemoveAllResult {
+        long removed_count{0};
+        int64_t freed_bytes{0};
+        // Whether the walk reached any object, and whether it left any
+        // behind (not removable, or its removal could not be queued).
+        bool saw_object{false};
+        bool skipped_object{false};
+    };
+    // One namespace's share of RemoveAll: removes every object that is
+    // complete, has no replication task and, unless `force`, whose lease has
+    // expired. `on_remove`, if set, sees each one just before it goes.
+    RemoveAllResult RemoveAllIn(
+        metadata::Namespace& ns, bool force,
+        std::chrono::system_clock::time_point now,
+        const std::function<void(const ObjectMetadata&)>& on_remove);
     void RebuildGroupState();
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
@@ -1290,25 +1282,24 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     // Publishes a new object under the key `hold` holds, which must hold none.
-    auto InsertMetadata(metadata::Namespace& ns, const route::WriteGuard& hold,
-                        const UUID& client_id, uint64_t value_length,
-                        const ReplicateConfig& config,
+    auto InsertMetadata(const route::WriteGuard& hold, const UUID& client_id,
+                        uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
                         std::optional<std::chrono::system_clock::time_point>
                             committed_soft_pin_timeout = std::nullopt)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+        -> std::vector<Replica::Descriptor>;
 
     // Helper: allocate replicas, build the object's envelope, publish it under
-    // the key `hold` holds, and return descriptor list.  Shared by PutStart and
-    // UpsertStart.
+    // the key `hold` holds in `ns`, which must hold none, and return descriptor
+    // list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
         metadata::Namespace& ns, const route::WriteGuard& hold,
         const UUID& client_id, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
-        const std::string& group_id, const TenantId& tenant_id,
+        const std::string& group_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1316,11 +1307,48 @@ class MasterService {
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // What PutStart and UpsertStart settle before they take the key.
+    struct WriteStartPlan {
+        ResolvedSoftPinRequest soft_pin_request;
+        // The writer's host, for same-node placement; empty when unused.
+        std::string writer_host_id;
+        std::string group_id;
+    };
+    // The checks and setup PutStart and UpsertStart share before they take the
+    // key: validates `config` for a write of `slice_length` bytes, records the
+    // client's host, and resolves the soft pin, the writer's host and the
+    // group. `action` names the caller in the log.
+    auto PrepareWriteStart(const UUID& client_id, const std::string& key,
+                           const TenantId& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config,
+                           std::string_view action)
+        -> tl::expected<WriteStartPlan, ErrorCode>;
+    class MetadataAccessorRW;
+    // A write's first step under the key: drops the held object's stale
+    // replica handles and, without the oplog, the object itself when none is
+    // left. With the oplog the cleanup is only queued and the write is refused
+    // with OBJECT_ALREADY_EXISTS.
+    auto CleanupStaleBeforeWrite(
+        const char* why, MetadataAccessorRW& accessor,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+        -> tl::expected<void, ErrorCode>;
+    // Runs a write's admission, which reports through its argument whether
+    // DFS allocation itself ran out of capacity. Only then is the admission
+    // retried: once behind any recovery already running, then once more
+    // after one forced bucket eviction. Memory or NoF exhaustion is left to
+    // the background eviction, so it cannot delete unrelated DFS data.
+    auto AdmitWithDfsRecovery(
+        const ReplicateConfig& config,
+        const std::function<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
+                bool* dfs_allocation_failed)>& admit)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     /**
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
-        metadata::Namespace& ns, const TenantId& tenant_id,
+        metadata::Namespace& ns,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1402,6 +1430,12 @@ class MasterService {
     // cluster-wide in-flight counter. Safe no-op if no task exists. The caller
     // holds the key's lock.
     void ErasePromotionTaskLocked(route::ObjectState& state);
+    // Tears down the object's promotion task, which it must have: the
+    // refcount on its source replica, the replica it staged, if any, and its
+    // in-flight count. The caller holds the key's lock and records the
+    // outcome.
+    void DropPromotionTaskLocked(ObjectMetadata& metadata,
+                                 route::ObjectState& state);
     // Cancels a promotion task whose alloc_id is among the removed replicas.
     // The caller holds the object's own lock.
     void CancelPromotionTaskForRemovedReplicas(
@@ -1513,9 +1547,8 @@ class MasterService {
         }
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            (void)service_->EraseMetadata(*ns_, *hold_, object_id_.tenant_id,
-                                          EraseMode::kFull,
-                                          previous_media_hint);
+            service_->EraseMetadata(*ns_, *hold_, EraseMode::kFull,
+                                    previous_media_hint);
         }
 
         void EraseFromProcessing() { hold_->state().is_processing = false; }
@@ -1526,8 +1559,7 @@ class MasterService {
         // Invalid memory replicas go first, which may tear the object down.
         void CleanUp() {
             if (IsPublished()) {
-                (void)service_->CleanupInvalidMemoryReplicas(
-                    object_id_.tenant_id, *ns_, *hold_);
+                service_->CleanupInvalidMemoryReplicas(*ns_, *hold_);
             }
         }
 
@@ -1586,11 +1618,8 @@ class MasterService {
     class MetadataAccessorRO {
        public:
         MetadataAccessorRO(const MasterService* service,
-                           ObjectIdentity object_id)
-            : object_id_(std::move(object_id)),
-              ns_(service->namespaces_.Lookup(object_id_.tenant_id)),
-              hold_(ns_ == nullptr ? std::nullopt
-                                   : ns_->objects.Read(object_id_.user_key)) {}
+                           const ObjectIdentity& object_id)
+            : hold_(Hold(service, object_id)) {}
 
         bool Exists() const {
             return IsPublished() && hold_->metadata().IsValid();
@@ -1603,19 +1632,19 @@ class MasterService {
             return hold_.has_value() && hold_->state().is_processing;
         }
 
-        const metadata::Namespace& GetNamespace() const { return *ns_; }
-
-        const std::string& GetKey() const { return object_id_.user_key; }
-        // The held publication; like `Get()`, only while one is held.
-        route::ObjectRef GetRef() const { return hold_->ref(); }
-
         const ObjectMetadata& Get() const { return hold_->metadata(); }
 
         const route::ObjectState& GetState() const { return hold_->state(); }
 
        private:
-        const ObjectIdentity object_id_;
-        metadata::Namespace* ns_;
+        static std::optional<route::ReadGuard> Hold(
+            const MasterService* service, const ObjectIdentity& object_id) {
+            const metadata::Namespace* ns =
+                service->namespaces_.Lookup(object_id.tenant_id);
+            return ns == nullptr ? std::nullopt
+                                 : ns->objects.Read(object_id.user_key);
+        }
+
         std::optional<route::ReadGuard> hold_;
     };
 
@@ -1743,8 +1772,8 @@ class MasterService {
         explicit PolicyStoreAccess(MasterService& service)
             : service_(service) {}
         void VisitNamespaces(
-            const std::function<void(const TenantId&, PolicyAttachment*,
-                                     route::ObjectRoute&)>& fn) override;
+            const std::function<void(const TenantId&, route::ObjectRoute&)>& fn)
+            override;
         size_t ObjectCount(const TenantId& tenant_id) const override;
         uint64_t AllocatableMemoryBytes() const override;
         EvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
@@ -1754,6 +1783,13 @@ class MasterService {
         MasterService& service_;
     };
     PolicyStoreAccess policy_store_access_{*this};
+
+    // Memory eviction (see eviction::Evictor) and what it is built from: the
+    // policy that picks memory replicas, the reclaimers that take them off,
+    // and the observers it reports to. Defined in master_service.cpp; built in
+    // the constructor once the offload settings are known.
+    struct MemoryEviction;
+    std::unique_ptr<MemoryEviction> memory_eviction_;
     // Multi-tenancy, when enabled; the namespace policy below points at it.
     std::unique_ptr<TenantQuotaPolicy> tenant_quota_policy_;
     // The policy every namespace is created under; null without one.

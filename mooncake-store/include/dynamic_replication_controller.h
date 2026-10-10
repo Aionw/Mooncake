@@ -33,7 +33,7 @@
 
 #include "client_liveness.h"
 #include "dynamic_replication_lease_table.h"
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 #include "object_metadata.h"
 #include "rpc_types.h"
 #include "segment.h"

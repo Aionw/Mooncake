@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 #include "common/shrink_buckets.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 

@@ -23,7 +23,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 #include "object_runtime_state.h"
 #include "tenant_id.h"
 #include "types.h"

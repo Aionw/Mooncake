@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <cstddef>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -16,22 +15,23 @@
 #include <vector>
 
 #include "object_metadata.h"
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 
 namespace mooncake {
 namespace test {
 
-// A minimal 128 B, replica-less envelope. These suites exercise the object
-// model, not replica validity, so nothing here sets a real replica. The write
-// time is fixed rather than read from the clock so a suite that ages a lease
-// cannot pick up a moving value.
-inline std::unique_ptr<ObjectMetadata> MakeObjectMetadata(
-    const std::string& user_key, const std::string& group_id = {}) {
-    constexpr auto kWriteTime =
+// Publishes a minimal 128 B, replica-less envelope under the key `guard` holds,
+// which holds no object, and returns its generation. These suites exercise the
+// object model, not replica validity, so nothing here sets a real replica. The
+// write time is fixed rather than read from the clock so a suite that ages a
+// lease cannot pick up a moving value.
+inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
+                                         const std::string& group_id = {}) {
+    const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    return std::make_unique<ObjectMetadata>(
-        UUID{1, 2}, kWriteTime, 128, std::vector<Replica>{}, std::nullopt,
-        false, ObjectDataType::UNKNOWN, group_id, TenantId(), user_key);
+    return guard.Publish(UUID{1, 2}, write_time, 128, std::vector<Replica>{},
+                         std::nullopt, false, ObjectDataType::UNKNOWN, group_id,
+                         TenantId(), guard.key());
 }
 
 // Publishes that envelope under `key` and returns its generation, or 0 when
@@ -43,7 +43,7 @@ inline route::Generation PublishObject(route::ObjectRoute& route,
     if (guard.has_object()) {
         return 0;
     }
-    return guard.Publish(MakeObjectMetadata(key, group_id));
+    return PublishEnvelope(guard, group_id);
 }
 
 // Reaches beneath the route's public surface: for the route's own suite,
@@ -60,10 +60,10 @@ struct ObjectRouteTestPeer {
         return count;
     }
 
-    // A strong reference to `key`'s slot, or null when the route has none.
-    // Holding it keeps an empty slot from being collected.
-    static std::shared_ptr<route::KeySlot> SlotRef(
-        const route::ObjectRoute& route, std::string_view key) {
+    // A handle on `key`'s slot, empty when the route has none. Holding it
+    // keeps an empty slot from being collected.
+    static route::SlotHandle SlotRef(const route::ObjectRoute& route,
+                                     std::string_view key) {
         return route.FindSlot(key);
     }
 
@@ -73,11 +73,11 @@ struct ObjectRouteTestPeer {
     // gathered under the stripe locks and locked only after those are let go,
     // since nothing waits for a slot lock while holding a stripe.
     static void DropGroupMemberships(route::ObjectRoute& route) {
-        std::vector<std::shared_ptr<route::KeySlot>> slots;
-        for (const auto& stripe : route.stripes_) {
+        std::vector<route::SlotHandle> slots;
+        for (auto& stripe : route.stripes_) {
             std::shared_lock<std::shared_mutex> lock(stripe.lock);
-            for (const auto& entry : stripe.slots) {
-                slots.push_back(entry.second);
+            for (auto& entry : stripe.slots) {
+                slots.emplace_back(entry.second);
             }
         }
         for (const auto& slot : slots) {
@@ -85,7 +85,7 @@ struct ObjectRouteTestPeer {
             if (!slot->record_.has_value()) {
                 continue;
             }
-            const std::string& group_id = slot->record_->metadata->group_id;
+            const std::string& group_id = slot->record_->metadata.group_id;
             if (!group_id.empty()) {
                 (void)route.groups_.RemoveMember(group_id, slot->key());
             }

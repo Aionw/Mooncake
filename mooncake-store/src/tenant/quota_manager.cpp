@@ -1,4 +1,4 @@
-#include "tenant_quota_manager.h"
+#include "tenant/quota_manager.h"
 
 #include <glog/logging.h>
 
@@ -8,17 +8,12 @@
 
 namespace mooncake {
 
-TenantQuotaManager::TenantQuotaManager(bool enabled,
-                                       CapacityFn allocatable_capacity)
-    : enabled_(enabled),
-      allocatable_capacity_(std::move(allocatable_capacity)) {}
+TenantQuotaManager::TenantQuotaManager(CapacityFn allocatable_capacity)
+    : allocatable_capacity_(std::move(allocatable_capacity)) {}
 
 void TenantQuotaManager::OpenPolicyStore(const std::string& type,
                                          const std::string& uri,
                                          const std::string& cluster_id) {
-    if (!enabled_) {
-        return;
-    }
     auto store = CreateTenantQuotaPolicyStore(type, uri, cluster_id);
     if (!store) {
         throw std::invalid_argument(store.error());
@@ -27,9 +22,6 @@ void TenantQuotaManager::OpenPolicyStore(const std::string& type,
 }
 
 void TenantQuotaManager::LoadPoliciesOrThrow() {
-    if (!enabled_) {
-        return;
-    }
     if (!policy_store_) {
         throw std::runtime_error(
             "tenant quota policy store is not initialized");
@@ -44,14 +36,10 @@ void TenantQuotaManager::LoadPoliciesOrThrow() {
 }
 
 TenantQuotaAccount& TenantQuotaManager::AccountFor(const TenantId& tenant_id) {
-    assert(enabled_);
     return *table_.GetOrCreateTenantHandle(tenant_id);
 }
 
 bool TenantQuotaManager::IsTenantRegistered(const TenantId& tenant_id) const {
-    if (!enabled_) {
-        return true;
-    }
     return table_.IsTenantRegistered(tenant_id);
 }
 
@@ -68,9 +56,6 @@ std::optional<TenantQuotaSnapshot> TenantQuotaManager::GetSnapshot(
 tl::expected<TenantQuotaSnapshot, ErrorCode> TenantQuotaManager::UpsertPolicy(
     const TenantId& tenant_id, uint64_t requested_quota_bytes) {
     assert(tenant_id.IsValid());
-    if (!enabled_) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
     if (requested_quota_bytes == 0 ||
         requested_quota_bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -98,10 +83,6 @@ TenantQuotaManager::DeletePolicy(
     const TenantId& tenant_id,
     const std::function<bool(const TenantId&)>& tenant_has_objects) {
     assert(tenant_id.IsValid());
-    if (!enabled_) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-
     std::lock_guard<std::mutex> policy_lock(policy_mutex_);
     auto policy = BuildPolicySnapshot();
     auto policy_it = policy.tenant_quotas.find(tenant_id.value());
@@ -146,17 +127,11 @@ TenantQuotaManager::DeletePolicy(
 }
 
 void TenantQuotaManager::Recompute() {
-    if (!enabled_) {
-        return;
-    }
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
     table_.RecomputeEffectiveQuotas(allocatable_capacity_());
 }
 
 void TenantQuotaManager::RebuildUsageOrThrow(const TenantQuotaUsageMap& usage) {
-    if (!enabled_) {
-        return;
-    }
     for (const auto& [tenant_id, _] : usage) {
         if (!table_.IsTenantRegistered(tenant_id)) {
             LOG(WARNING)

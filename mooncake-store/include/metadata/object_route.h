@@ -23,6 +23,11 @@
 // cursor holds the one it stands on), since two writers each holding one key
 // and waiting for the other's would deadlock. The group index is a leaf under
 // a slot lock.
+//
+// Layout: every key costs one allocation. Its slot lives in its stripe's map
+// node, next to the key it is filed under, and holds the object inline. Guards
+// and cursors keep a slot in the map with a SlotHandle; a slot that holds no
+// object leaves the map once no handle holds it.
 
 #include <array>
 #include <atomic>
@@ -41,9 +46,11 @@
 #include <utility>
 #include <vector>
 
-#include "common/intrusive_list.h"
+#include <boost/intrusive/list.hpp>
+
+#include "common/heap_optional.h"
 #include "common/transparent_string_hash.h"
-#include "group_index.h"
+#include "metadata/group_index.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
 
@@ -51,9 +58,6 @@ namespace mooncake {
 
 // How a key is locked: shared to read it, exclusive to write it.
 enum class LockMode { kRead, kWrite };
-
-// Tags the hook that links a slot into its owner's in-flight list.
-struct InFlightListTag;
 
 namespace test {
 struct ObjectRouteTestPeer;
@@ -74,14 +78,17 @@ struct ObjectRef {
 // The per-object runtime state the route keeps next to the metadata: the task
 // in flight for the key, at most one of each kind, and the bookkeeping of the
 // subsystems that act on it.
+//
+// Every key carries one, and almost every key carries no task, so each task
+// lives on the heap and costs a pointer while absent.
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
-    std::optional<ReplicationTask> replication_task;
-    std::optional<OffloadingTask> offloading_task;
-    std::optional<PromotionTask> promotion_task;
-    std::optional<PromotionCandidate> promotion_candidate;
-    std::optional<DynamicReplicaPending> dynamic_replication_pending;
+    HeapOptional<ReplicationTask> replication_task;
+    HeapOptional<OffloadingTask> offloading_task;
+    HeapOptional<PromotionTask> promotion_task;
+    HeapOptional<PromotionCandidate> promotion_candidate;
+    HeapOptional<DynamicReplicaPending> dynamic_replication_pending;
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
     // True while a primary write or a replication, offloading or promotion
@@ -98,9 +105,18 @@ struct ObjectState {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
+    // Whether the owner's eviction index files the slot, and at what rank.
+    bool eviction_filed{false};
+    int64_t eviction_rank{0};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
 };
+
+// A slot's lock as a guard or cursor holds it in `kMode`.
+template <LockMode kMode>
+using SlotLock = std::conditional_t<kMode == LockMode::kWrite,
+                                    std::unique_lock<std::shared_mutex>,
+                                    std::shared_lock<std::shared_mutex>>;
 
 class ObjectRoute;
 template <LockMode kMode>
@@ -108,41 +124,110 @@ class Guard;
 using ReadGuard = Guard<LockMode::kRead>;
 using WriteGuard = Guard<LockMode::kWrite>;
 
-// One key's lock and, while the key holds an object, its record. Only the
-// route and its guards reach inside.
-class KeySlot : private IntrusiveListHook<InFlightListTag> {
+// One key's lock and, while the key holds an object, its record. A slot lives
+// in its stripe's map node and never moves. Only the route and its guards
+// reach inside.
+class KeySlot {
    public:
-    explicit KeySlot(std::string key) : key_(std::move(key)) {}
+    KeySlot() = default;
     KeySlot(const KeySlot&) = delete;
     KeySlot& operator=(const KeySlot&) = delete;
 
-    const std::string& key() const noexcept { return key_; }
+    const std::string& key() const noexcept { return *key_; }
 
    private:
     friend class ObjectRoute;
+    friend class SlotHandle;
     template <LockMode>
     friend class Guard;
-    friend class IntrusiveList<KeySlot, InFlightListTag>;
     friend struct test::ObjectRouteTestPeer;
 
+    // Links the slot into one of its owner's lists. Neither the hook nor the
+    // list synchronizes: whatever guards a list guards every hook in it. A
+    // safe-link hook asserts it is unlinked when destroyed, and a list unlinks
+    // whatever it still holds when it is cleared or destroyed.
+    using ListHook = boost::intrusive::list_member_hook<
+        boost::intrusive::link_mode<boost::intrusive::safe_link>>;
+
+    // One publication. The metadata is built in place, since it can be
+    // neither copied nor moved.
     struct Record {
+        template <typename... Args>
+        explicit Record(Generation publication, Args&&... metadata_args)
+            : generation(publication),
+              metadata(std::forward<Args>(metadata_args)...) {}
+
         Generation generation;
-        std::unique_ptr<ObjectMetadata> metadata;
+        ObjectMetadata metadata;
         ObjectState state;
     };
 
-    const std::string key_;
+    // The key the map files this slot under, in the same node.
+    const std::string* key_ = nullptr;
+    // How many SlotHandles hold the slot. The map's own entry is not one.
+    std::atomic<uint32_t> holders_{0};
     mutable std::shared_mutex mutex_;
     std::optional<Record> record_;
     SlotOwnerState owner_;
+    // Hooks into the owner's in-flight list and its eviction index.
+    ListHook in_flight_hook_;
+    ListHook eviction_hook_;
+
+   public:
+    // The owner's lists of slots. Each names its hook here, where the hook is
+    // accessible, so the slot needs no friend for them.
+    using InFlightList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::in_flight_hook_>>;
+    using EvictionList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::eviction_hook_>>;
 };
 
-// Called by the route as a write guard it handed out is released, with the slot
+// A counted hold on a slot. A slot that holds no object stays in the route's
+// map while any handle holds it, so a holder can still lock it. A handle is
+// only made under the slot's stripe lock, so a collector holding that lock
+// exclusively knows no new holder can appear. The route owns its slots, so a
+// handle must not outlive it.
+class SlotHandle {
+   public:
+    SlotHandle() = default;
+    explicit SlotHandle(KeySlot& slot) noexcept : slot_(&slot) {
+        slot.holders_.fetch_add(1, std::memory_order_relaxed);
+    }
+    SlotHandle(SlotHandle&& other) noexcept
+        : slot_(std::exchange(other.slot_, nullptr)) {}
+    SlotHandle(const SlotHandle&) = delete;
+    SlotHandle& operator=(const SlotHandle&) = delete;
+    SlotHandle& operator=(SlotHandle&&) = delete;
+    ~SlotHandle() { reset(); }
+
+    KeySlot* get() const noexcept { return slot_; }
+    KeySlot& operator*() const noexcept { return *slot_; }
+    KeySlot* operator->() const noexcept { return slot_; }
+    explicit operator bool() const noexcept { return slot_ != nullptr; }
+
+    // Lets go of the slot. A collector that then finds no holder sees every
+    // access this holder made.
+    void reset() noexcept {
+        if (slot_ != nullptr) {
+            slot_->holders_.fetch_sub(1, std::memory_order_release);
+            slot_ = nullptr;
+        }
+    }
+
+   private:
+    KeySlot* slot_ = nullptr;
+};
+
+// Called by the route as a guard it handed out is released, with the slot
 // locked: what the owner keeps about the key is settled there, so the code
-// that changed the key need not do it.
+// that changed the key need not do it. Read releases are reported only to a
+// route built to report them, since every read pays for the call.
 class RouteObserver {
    public:
     virtual void OnWriteRelease(const WriteGuard& guard) = 0;
+    virtual void OnReadRelease(const ReadGuard& /*guard*/) {}
 
    protected:
     ~RouteObserver() = default;
@@ -152,14 +237,13 @@ class RouteObserver {
 // one. A write guard may hold a key with no object (see
 // ObjectRoute::WriteOrCreate); a read guard always holds an object.
 //
-// A guard owns a strong reference to its slot, so the slot outlives its lock.
-// It moves but does not assign, since assigning would drop one key's lock
-// while taking another's.
+// A guard holds its slot with a SlotHandle, so the slot outlives its lock. It
+// moves but does not assign, since assigning would drop one key's lock while
+// taking another's.
 template <LockMode kMode>
 class Guard {
     static constexpr bool kWrite = kMode == LockMode::kWrite;
-    using Lock = std::conditional_t<kWrite, std::unique_lock<std::shared_mutex>,
-                                    std::shared_lock<std::shared_mutex>>;
+    using Lock = SlotLock<kMode>;
 
    public:
     using Metadata =
@@ -184,13 +268,18 @@ class Guard {
     // The rest require has_object().
     Generation generation() const { return record().generation; }
     ObjectRef ref() const { return {key(), generation()}; }
-    Metadata& metadata() const { return *record().metadata; }
+    Metadata& metadata() const { return record().metadata; }
     State& state() const { return record().state; }
 
-    // Publishes `metadata` under this key, which holds no object, wiring its
-    // group membership and the group's shared lease; the state starts empty.
-    // Returns the new publication's generation.
-    Generation Publish(std::unique_ptr<ObjectMetadata> metadata) const
+    // Publishes an object under this key, which holds none: builds its
+    // metadata in place from `metadata_args`, ObjectMetadata's constructor
+    // arguments, and wires its group membership and the group's shared lease;
+    // the state starts empty. Returns the new publication's generation.
+    //
+    // Nobody else can reach the object until the guard is released, so the
+    // caller finishes setting it up through metadata() and state().
+    template <typename... Args>
+    Generation Publish(Args&&... metadata_args) const
         requires kWrite;
 
     // Ends the publication this guard holds: drops its group membership and
@@ -211,8 +300,7 @@ class Guard {
    private:
     friend class ObjectRoute;
 
-    Guard(ObjectRoute* route,
-          std::shared_ptr<KeySlot> slot) NO_THREAD_SAFETY_ANALYSIS
+    Guard(ObjectRoute* route, SlotHandle slot) NO_THREAD_SAFETY_ANALYSIS
         : route_(route),
           slot_(std::move(slot)),
           lock_(slot_->mutex_) {}
@@ -232,35 +320,49 @@ class Guard {
 
     ObjectRoute* route_;
     // Declared before the lock so it is destroyed after it.
-    std::shared_ptr<KeySlot> slot_;
+    SlotHandle slot_;
     Lock lock_;
     bool handed_out_ = false;
 };
 
 class ObjectRoute {
-    // Keyed by a view of the slot's own key, which lives as long as the entry.
-    using SlotMap =
-        std::unordered_map<std::string_view, std::shared_ptr<KeySlot>,
-                           TransparentStringHash, std::equal_to<>>;
+    // Each slot is built in its map node and stays there while the map
+    // grows, so a slot's address and its key's are stable.
+    using SlotMap = std::unordered_map<std::string, KeySlot,
+                                       TransparentStringHash, std::equal_to<>>;
 
    public:
-    static constexpr size_t kStripeCount = 64;
+    // A stripe's map rehashes under its exclusive lock, which stalls every
+    // reader of the stripe, and a batch read touches every stripe. Many
+    // small stripes keep each stall short.
+    static constexpr size_t kStripeCount = 1024;
 
-    // `observer`, when set, outlives the route.
-    explicit ObjectRoute(RouteObserver* observer = nullptr)
-        : observer_(observer) {}
+    // `observer`, when set, outlives the route; it hears of read releases
+    // only when `report_reads` is set.
+    explicit ObjectRoute(RouteObserver* observer = nullptr,
+                         bool report_reads = false)
+        : observer_(observer),
+          report_reads_(observer != nullptr && report_reads) {}
     ObjectRoute(const ObjectRoute&) = delete;
     ObjectRoute& operator=(const ObjectRoute&) = delete;
 
     // The object under `key`, held shared; nullopt when the key holds none.
-    [[nodiscard]] std::optional<ReadGuard> Read(std::string_view key) const;
+    [[nodiscard]] std::optional<ReadGuard> Read(std::string_view key) const {
+        return Acquire<LockMode::kRead>(key, std::nullopt);
+    }
     // The same, only while `ref` is still the key's current publication.
-    [[nodiscard]] std::optional<ReadGuard> Read(const ObjectRef& ref) const;
+    [[nodiscard]] std::optional<ReadGuard> Read(const ObjectRef& ref) const {
+        return Acquire<LockMode::kRead>(ref.key, ref.generation);
+    }
 
     // The object under `key`, held exclusively; nullopt when it holds none.
-    [[nodiscard]] std::optional<WriteGuard> Write(std::string_view key);
+    [[nodiscard]] std::optional<WriteGuard> Write(std::string_view key) {
+        return Acquire<LockMode::kWrite>(key, std::nullopt);
+    }
     // The same, only while `ref` is still the key's current publication.
-    [[nodiscard]] std::optional<WriteGuard> Write(const ObjectRef& ref);
+    [[nodiscard]] std::optional<WriteGuard> Write(const ObjectRef& ref) {
+        return Acquire<LockMode::kWrite>(ref.key, ref.generation);
+    }
     // The key held exclusively whether or not it holds an object, so the
     // caller can publish one.
     [[nodiscard]] WriteGuard WriteOrCreate(std::string_view key);
@@ -342,15 +444,21 @@ class ObjectRoute {
         return stripes_[StripeIndex(key)];
     }
 
-    [[nodiscard]] std::shared_ptr<KeySlot> FindSlot(std::string_view key) const;
-    [[nodiscard]] std::shared_ptr<KeySlot> FindOrCreateSlot(
-        std::string_view key);
-    // Drops `slot` from the map when it holds no object and `slot` is the
-    // last reference outside the map. Called with no slot lock held.
-    void Collect(std::shared_ptr<KeySlot> slot);
+    // The key locked in `kMode`, handed out only while it holds an object
+    // and, given a `generation`, only while that is the current publication.
+    template <LockMode kMode>
+    [[nodiscard]] std::optional<Guard<kMode>> Acquire(
+        std::string_view key, std::optional<Generation> generation) const;
 
-    Generation PublishLocked(KeySlot& slot,
-                             std::unique_ptr<ObjectMetadata> metadata);
+    // A handle on `key`'s slot; empty when the route has none.
+    [[nodiscard]] SlotHandle FindSlot(std::string_view key) const;
+    [[nodiscard]] SlotHandle FindOrCreateSlot(std::string_view key);
+    // Drops the slot `handle` holds from the map when it holds no object and
+    // `handle` is its only holder. Called with no slot lock held.
+    void Collect(SlotHandle handle);
+
+    template <typename... Args>
+    Generation PublishLocked(KeySlot& slot, Args&&... metadata_args);
     void TearDownLocked(KeySlot& slot);
 
     // How many stripe locks this thread holds for a cursor. A route access
@@ -363,6 +471,7 @@ class ObjectRoute {
     }
 
     RouteObserver* const observer_;
+    const bool report_reads_;
     std::atomic<Generation> next_generation_{1};
     std::atomic<size_t> object_count_{0};
     mutable std::array<Stripe, kStripeCount> stripes_;
@@ -380,9 +489,7 @@ class ObjectRoute {
     template <LockMode kMode>
     class Cursor {
         static constexpr bool kWrite = kMode == LockMode::kWrite;
-        using SlotLock =
-            std::conditional_t<kWrite, std::unique_lock<std::shared_mutex>,
-                               std::shared_lock<std::shared_mutex>>;
+        using Lock = SlotLock<kMode>;
 
        public:
         // The object a position stands on, valid until the cursor advances.
@@ -394,7 +501,7 @@ class ObjectRoute {
             const std::string& key() const { return slot_.key(); }
             Generation generation() const { return slot_.record_->generation; }
             ObjectRef ref() const { return {key(), generation()}; }
-            Metadata& metadata() const { return *slot_.record_->metadata; }
+            Metadata& metadata() const { return slot_.record_->metadata; }
             State& state() const { return slot_.record_->state; }
             // The owner's per-slot state, for the route's owner only.
             SlotOwnerState& owner_state() const
@@ -431,7 +538,7 @@ class ObjectRoute {
         Cursor(const Cursor&) = delete;
         Cursor& operator=(const Cursor&) = delete;
         ~Cursor() {
-            slot_lock_ = SlotLock();
+            slot_lock_ = Lock();
             ReleaseStripe();
         }
 
@@ -449,7 +556,7 @@ class ObjectRoute {
             assert(!kWrite || current_ == nullptr ||
                    current_->record_->state.HasInFlightWork() ==
                        visited_in_flight_);
-            slot_lock_ = SlotLock();
+            slot_lock_ = Lock();
             if (stripe_ < kStripeCount) {
                 ++slot_it_;
             } else {
@@ -462,7 +569,7 @@ class ObjectRoute {
         // lock it obtains, or to the end.
         void Settle() NO_THREAD_SAFETY_ANALYSIS {
             for (; stripe_ < kStripeCount; ++stripe_) {
-                const Stripe& stripe = route_.stripes_[stripe_];
+                Stripe& stripe = route_.stripes_[stripe_];
                 if (!stripe_lock_.owns_lock()) {
                     AssertNotInCursor();
                     stripe_lock_ =
@@ -471,10 +578,10 @@ class ObjectRoute {
                     slot_it_ = stripe.slots.begin();
                 }
                 for (; slot_it_ != stripe.slots.end(); ++slot_it_) {
-                    KeySlot& slot = *slot_it_->second;
-                    SlotLock lock(slot.mutex_, std::try_to_lock);
+                    KeySlot& slot = slot_it_->second;
+                    Lock lock(slot.mutex_, std::try_to_lock);
                     if (!lock.owns_lock()) {
-                        deferred_.push_back(slot_it_->second);
+                        deferred_.emplace_back(slot);
                         continue;
                     }
                     if (slot.record_.has_value()) {
@@ -486,7 +593,7 @@ class ObjectRoute {
             }
             for (; deferred_pos_ < deferred_.size(); ++deferred_pos_) {
                 KeySlot& slot = *deferred_[deferred_pos_];
-                SlotLock lock(slot.mutex_);
+                Lock lock(slot.mutex_);
                 if (slot.record_.has_value()) {
                     Stand(slot, std::move(lock));
                     return;
@@ -495,7 +602,7 @@ class ObjectRoute {
             current_ = nullptr;
         }
 
-        void Stand(KeySlot& slot, SlotLock lock) {
+        void Stand(KeySlot& slot, Lock lock) {
             slot_lock_ = std::move(lock);
             current_ = &slot;
             visited_in_flight_ = slot.record_->state.HasInFlightWork();
@@ -511,12 +618,12 @@ class ObjectRoute {
         const ObjectRoute& route_;
         size_t stripe_ = 0;
         std::shared_lock<std::shared_mutex> stripe_lock_;
-        typename SlotMap::const_iterator slot_it_;
+        typename SlotMap::iterator slot_it_;
         // Slots that were busy when the cursor passed their stripe; the
-        // references keep them alive until they are visited.
-        std::vector<std::shared_ptr<KeySlot>> deferred_;
+        // handles keep them in the map until they are visited.
+        std::vector<SlotHandle> deferred_;
         size_t deferred_pos_ = 0;
-        SlotLock slot_lock_;
+        Lock slot_lock_;
         KeySlot* current_ = nullptr;
         // Whether the object stood on carried in-flight work when reached.
         bool visited_in_flight_ = false;
@@ -534,6 +641,10 @@ Guard<kMode>::~Guard() {
         if (handed_out_ && route_->observer_ != nullptr) {
             route_->observer_->OnWriteRelease(*this);
         }
+    } else {
+        if (handed_out_ && route_->report_reads_) {
+            route_->observer_->OnReadRelease(*this);
+        }
     }
     const bool empty = !slot_->record_.has_value();
     lock_.unlock();
@@ -543,12 +654,12 @@ Guard<kMode>::~Guard() {
 }
 
 template <LockMode kMode>
-Generation Guard<kMode>::Publish(std::unique_ptr<ObjectMetadata> metadata) const
+template <typename... Args>
+Generation Guard<kMode>::Publish(Args&&... metadata_args) const
     requires kWrite
 {
     assert(!has_object());
-    assert(metadata != nullptr && metadata->user_key == key());
-    return route_->PublishLocked(*slot_, std::move(metadata));
+    return route_->PublishLocked(*slot_, std::forward<Args>(metadata_args)...);
 }
 
 template <LockMode kMode>
@@ -561,120 +672,89 @@ void Guard<kMode>::TearDown() const
 
 // --- ObjectRoute ------------------------------------------------------------
 
-inline std::shared_ptr<KeySlot> ObjectRoute::FindSlot(
-    std::string_view key) const {
+inline SlotHandle ObjectRoute::FindSlot(std::string_view key) const {
     AssertNotInCursor();
     Stripe& stripe = StripeOf(key);
     std::shared_lock<std::shared_mutex> lock(stripe.lock);
     const auto it = stripe.slots.find(key);
-    return it == stripe.slots.end() ? nullptr : it->second;
+    return it == stripe.slots.end() ? SlotHandle() : SlotHandle(it->second);
 }
 
-inline std::shared_ptr<KeySlot> ObjectRoute::FindOrCreateSlot(
-    std::string_view key) {
-    if (auto slot = FindSlot(key)) {
+inline SlotHandle ObjectRoute::FindOrCreateSlot(std::string_view key) {
+    if (SlotHandle slot = FindSlot(key)) {
         return slot;
     }
     Stripe& stripe = StripeOf(key);
     std::unique_lock<std::shared_mutex> lock(stripe.lock);
-    if (const auto it = stripe.slots.find(key); it != stripe.slots.end()) {
-        return it->second;
+    const auto [it, created] = stripe.slots.try_emplace(std::string(key));
+    if (created) {
+        it->second.key_ = &it->first;
     }
-    auto slot = std::make_shared<KeySlot>(std::string(key));
-    stripe.slots.emplace(slot->key(), slot);
-    return slot;
+    return SlotHandle(it->second);
 }
 
-inline void ObjectRoute::Collect(std::shared_ptr<KeySlot> slot) {
-    Stripe& stripe = StripeOf(slot->key());
+inline void ObjectRoute::Collect(SlotHandle handle) {
+    Stripe& stripe = StripeOf(handle->key());
     std::unique_lock<std::shared_mutex> lock(stripe.lock);
-    // A new reference is only made under the stripe lock, so with the map's
-    // and ours the only ones, nobody else can reach the slot. Locking it then
-    // never waits, and it orders this read of the record after the last
-    // writer's release.
-    if (slot.use_count() != 2) {
+    // A handle is only made under the stripe lock, so with ours the only one,
+    // nobody else can reach the slot. Locking it then never waits, and it
+    // orders this read of the record after the last writer's release.
+    if (handle->holders_.load(std::memory_order_acquire) != 1) {
         stripe.uncollected.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    std::unique_lock<std::shared_mutex> slot_lock(slot->mutex_,
+    std::unique_lock<std::shared_mutex> slot_lock(handle->mutex_,
                                                   std::try_to_lock);
-    if (!slot_lock.owns_lock() || slot->record_.has_value()) {
+    if (!slot_lock.owns_lock() || handle->record_.has_value()) {
         return;
     }
-    stripe.slots.erase(slot->key());
+    // Erasing destroys the slot, so its lock and our hold go first.
+    const auto it = stripe.slots.find(handle->key());
+    slot_lock.unlock();
+    handle.reset();
+    stripe.slots.erase(it);
 }
 
-inline std::optional<ReadGuard> ObjectRoute::Read(std::string_view key) const {
-    auto slot = FindSlot(key);
-    if (slot == nullptr) {
+template <LockMode kMode>
+std::optional<Guard<kMode>> ObjectRoute::Acquire(
+    std::string_view key, std::optional<Generation> generation) const {
+    SlotHandle slot = FindSlot(key);
+    if (!slot) {
         return std::nullopt;
     }
-    ReadGuard guard(const_cast<ObjectRoute*>(this), std::move(slot));
-    if (!guard.has_object()) {
+    Guard<kMode> guard(const_cast<ObjectRoute*>(this), std::move(slot));
+    if (!guard.has_object() ||
+        (generation.has_value() && guard.generation() != *generation)) {
         return std::nullopt;
     }
-    return std::optional<ReadGuard>(std::move(guard).HandOut());
-}
-
-inline std::optional<ReadGuard> ObjectRoute::Read(const ObjectRef& ref) const {
-    auto slot = FindSlot(ref.key);
-    if (slot == nullptr) {
-        return std::nullopt;
-    }
-    ReadGuard guard(const_cast<ObjectRoute*>(this), std::move(slot));
-    if (!guard.has_object() || guard.generation() != ref.generation) {
-        return std::nullopt;
-    }
-    return std::optional<ReadGuard>(std::move(guard).HandOut());
-}
-
-inline std::optional<WriteGuard> ObjectRoute::Write(std::string_view key) {
-    auto slot = FindSlot(key);
-    if (slot == nullptr) {
-        return std::nullopt;
-    }
-    WriteGuard guard(this, std::move(slot));
-    if (!guard.has_object()) {
-        return std::nullopt;
-    }
-    return std::optional<WriteGuard>(std::move(guard).HandOut());
-}
-
-inline std::optional<WriteGuard> ObjectRoute::Write(const ObjectRef& ref) {
-    auto slot = FindSlot(ref.key);
-    if (slot == nullptr) {
-        return std::nullopt;
-    }
-    WriteGuard guard(this, std::move(slot));
-    if (!guard.has_object() || guard.generation() != ref.generation) {
-        return std::nullopt;
-    }
-    return std::optional<WriteGuard>(std::move(guard).HandOut());
+    return std::optional<Guard<kMode>>(std::move(guard).HandOut());
 }
 
 inline WriteGuard ObjectRoute::WriteOrCreate(std::string_view key) {
     return WriteGuard(this, FindOrCreateSlot(key)).HandOut();
 }
 
-inline Generation ObjectRoute::PublishLocked(
-    KeySlot& slot, std::unique_ptr<ObjectMetadata> metadata) {
+template <typename... Args>
+Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
     const Generation generation =
         next_generation_.fetch_add(1, std::memory_order_relaxed);
-    if (!metadata->group_id.empty()) {
+    ObjectMetadata& metadata =
+        slot.record_.emplace(generation, std::forward<Args>(metadata_args)...)
+            .metadata;
+    assert(metadata.user_key == slot.key());
+    if (!metadata.group_id.empty()) {
         // AddMember returns null only for an empty group_id.
-        auto lease = groups_.AddMember(metadata->group_id, slot.key());
+        auto lease = groups_.AddMember(metadata.group_id, slot.key());
         assert(lease != nullptr);
-        SpinLocker locker(&metadata->lock);
-        metadata->lease_ = std::move(lease);
+        SpinLocker locker(&metadata.lock);
+        metadata.lease_ = std::move(lease);
     }
-    slot.record_.emplace(
-        KeySlot::Record{generation, std::move(metadata), ObjectState{}});
     object_count_.fetch_add(1, std::memory_order_relaxed);
     return generation;
 }
 
 inline void ObjectRoute::TearDownLocked(KeySlot& slot) {
-    const std::string& group_id = slot.record_->metadata->group_id;
+    const std::string& group_id = slot.record_->metadata.group_id;
     if (!group_id.empty()) {
         (void)groups_.RemoveMember(group_id, slot.key());
     }
@@ -733,20 +813,20 @@ inline size_t ObjectRoute::SweepEmptySlots() {
         std::unique_lock<std::shared_mutex> lock(stripe.lock);
         stripe.uncollected.store(0, std::memory_order_relaxed);
         for (auto it = stripe.slots.begin(); it != stripe.slots.end();) {
-            KeySlot& slot = *it->second;
+            KeySlot& slot = it->second;
             std::unique_lock<std::shared_mutex> slot_lock(slot.mutex_,
                                                           std::try_to_lock);
             if (!slot_lock.owns_lock() || slot.record_.has_value()) {
                 // A holder collects the slot itself if it leaves it empty.
                 ++it;
-            } else if (it->second.use_count() != 1) {
-                // Empty but still referenced, as by a cursor that set it
-                // aside: try again on the next sweep.
+            } else if (slot.holders_.load(std::memory_order_acquire) != 0) {
+                // Empty but still held, as by a cursor that set it aside: try
+                // again on the next sweep.
                 stripe.uncollected.fetch_add(1, std::memory_order_relaxed);
                 ++it;
             } else {
-                // Only the map references it, and nobody can make a new
-                // reference while the stripe is held.
+                // Nothing holds it, and nobody can make a new handle while the
+                // stripe is held.
                 slot_lock.unlock();
                 it = stripe.slots.erase(it);
                 ++swept;

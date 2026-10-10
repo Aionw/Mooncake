@@ -1,4 +1,4 @@
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 #include "object_test_helpers.h"
 
 #include <algorithm>
@@ -67,7 +67,7 @@ TEST(ObjectRouteTest, PublishMakesTheObjectReachableUnderItsKey) {
         auto guard = route.WriteOrCreate("k1");
         EXPECT_EQ(guard.key(), "k1");
         EXPECT_FALSE(guard.has_object());
-        generation = guard.Publish(test::MakeObjectMetadata("k1"));
+        generation = test::PublishEnvelope(guard);
         // The guard that published now holds the object it published.
         ASSERT_TRUE(guard.has_object());
         EXPECT_EQ(guard.generation(), generation);
@@ -206,7 +206,7 @@ TEST(ObjectRouteTest, PublishAfterTearDownOnTheSameGuardReplacesTheObject) {
         guard.TearDown();
         EXPECT_FALSE(guard.has_object());
         EXPECT_EQ(route.ObjectCount(), 0u);
-        second = guard.Publish(test::MakeObjectMetadata("k1", "g2"));
+        second = test::PublishEnvelope(guard, "g2");
         ASSERT_TRUE(guard.has_object());
         EXPECT_EQ(guard.generation(), second);
         EXPECT_EQ(guard.metadata().group_id, "g2");
@@ -381,7 +381,7 @@ TEST(ObjectRouteTest, ContainsSeesOnlyKeysThatHoldAnObject) {
     // A slot kept alive without an object does not count as one.
     const auto kept = ObjectRouteTestPeer::SlotRef(route, "k1");
     ASSERT_TRUE(TearDownKey(route, "k1"));
-    ASSERT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1"), kept);
+    ASSERT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1").get(), kept.get());
     EXPECT_FALSE(route.Contains("k1"));
 }
 
@@ -403,14 +403,14 @@ TEST(ObjectRouteTest, EmptySlotGoesWithItsLastWriter) {
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 2u);
     ASSERT_TRUE(TearDownKey(route, "k1"));
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
-    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1"), nullptr);
-    EXPECT_NE(ObjectRouteTestPeer::SlotRef(route, "k2"), nullptr);
+    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1").get(), nullptr);
+    EXPECT_NE(ObjectRouteTestPeer::SlotRef(route, "k2").get(), nullptr);
 
     // A replacement under one guard keeps its slot.
     {
         auto guard = route.WriteOrCreate("k2");
         guard.TearDown();
-        (void)guard.Publish(test::MakeObjectMetadata("k2"));
+        (void)test::PublishEnvelope(guard);
     }
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
     // So does a read or write of a key that holds an object.
@@ -454,10 +454,10 @@ TEST(ObjectRouteTest, ReferencedEmptySlotSurvivesUntilSwept) {
     // Someone else still references k1's slot when its last writer leaves it
     // empty, so the writer cannot collect it.
     auto kept = ObjectRouteTestPeer::SlotRef(route, "k1");
-    ASSERT_NE(kept, nullptr);
+    ASSERT_NE(kept.get(), nullptr);
     ASSERT_TRUE(TearDownKey(route, "k1"));
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 2u);
-    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1"), kept);
+    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1").get(), kept.get());
 
     // While it is referenced the sweep leaves it too.
     EXPECT_EQ(route.SweepEmptySlots(), 0u);
@@ -480,7 +480,7 @@ TEST(ObjectRouteTest, KeptSlotIsReusedByTheNextPublication) {
     // While a slot exists it is the only one for its key, so the next
     // publication lands in it rather than in a second one.
     ASSERT_NE(PublishObject(route, "k1"), 0u);
-    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1"), kept);
+    EXPECT_EQ(ObjectRouteTestPeer::SlotRef(route, "k1").get(), kept.get());
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
     kept.reset();
     EXPECT_EQ(route.SweepEmptySlots(), 0u);
@@ -675,7 +675,7 @@ TEST(ObjectRouteTest, ObserverSeesEveryWriteGuardAsItIsReleased) {
     // and only once: the guard's moves are not releases.
     {
         auto guard = route.WriteOrCreate("k1");
-        (void)guard.Publish(test::MakeObjectMetadata("k1"));
+        (void)test::PublishEnvelope(guard);
         guard.state().is_processing = true;
         EXPECT_EQ(observer.releases.size(), 1u);
     }
@@ -772,7 +772,7 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                     if (guard.has_object()) {
                         continue;
                     }
-                    (void)guard.Publish(test::MakeObjectMetadata(key, "g1"));
+                    (void)test::PublishEnvelope(guard, "g1");
                     ref = guard.ref();
                     if (!is_member(key)) {
                         violation();

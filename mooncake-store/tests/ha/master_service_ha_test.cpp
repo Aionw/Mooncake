@@ -5479,6 +5479,70 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
     EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
 }
 
+// The completion of an offload the master queued registers the local-disk
+// replica on the existing object, so the standby must hear of it too.
+TEST_F(MasterServiceHATest, OffloadCompletionWritesBatchRecordOpLog) {
+    const std::string cluster_id = "test_batch_record_offload_completion";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_offload(true)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string segment_name = "batch_offload_completion_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/true)
+                    .has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "batch_offload_completion_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment_name);
+    ReadBatchEventually(storage, 2, batch);
+
+    // PutEnd queued the offload, so the completion below finds its task on
+    // the object rather than registering the replica afresh.
+    auto queued = service.OffloadObjectHeartbeat(mounted.client_id, true);
+    ASSERT_TRUE(queued.has_value()) << toString(queued.error());
+    ASSERT_EQ(1u, queued->size());
+    ASSERT_EQ(key, queued->front().key);
+
+    StorageObjectMetadata stored;
+    stored.data_size = 1024;
+    stored.transport_endpoint = "offload_completion_endpoint";
+    ASSERT_TRUE(service
+                    .NotifyOffloadSuccess(mounted.client_id, {queued->front()},
+                                          {stored})
+                    .has_value());
+
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    EXPECT_TRUE(std::any_of(payload.replicas.begin(), payload.replicas.end(),
+                            [](const Replica::Descriptor& replica) {
+                                return replica.is_local_disk_replica();
+                            }));
+    EXPECT_TRUE(std::any_of(payload.replicas.begin(), payload.replicas.end(),
+                            [](const Replica::Descriptor& replica) {
+                                return replica.is_memory_replica();
+                            }));
+}
+
 #ifdef USE_NOF
 TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_nof_evict_cluster";

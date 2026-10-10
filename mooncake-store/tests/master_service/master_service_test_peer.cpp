@@ -42,7 +42,7 @@ void MasterServiceTestPeer::RunDfsEvictionForTesting() {
 void MasterServiceTestPeer::RunTenantEvictForTesting() {
     // The policy throttles its pass; a test asks for one now.
     service_.tenant_quota_policy_->next_eviction_check_ = {};
-    service_.tenant_quota_policy_->OnMaintenance(service_.policy_store_access_);
+    service_.tenant_quota_policy_->OnMaintenance();
 }
 
 void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
@@ -123,10 +123,9 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     // an absent key is seeded with a publication of its own.
     const auto hold = ns.objects.WriteOrCreate(key);
     if (!hold.has_object()) {
-        hold.Publish(std::make_unique<ObjectMetadata>(
-            holder_id, std::chrono::system_clock::now(), object_size,
-            std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, std::string{}, tenant_id, key));
+        hold.Publish(holder_id, std::chrono::system_clock::now(), object_size,
+                     std::vector<Replica>{}, std::nullopt, false,
+                     ObjectDataType::UNKNOWN, std::string{}, tenant_id, key);
     }
     hold.state().promotion_task =
         PromotionTask{.source_id = 0,

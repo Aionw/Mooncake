@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -298,7 +298,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         metadata::Namespace& ns =
             GetOrCreateNamespaceForTest(service, tenant_id);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            ns, tenant_id, std::chrono::system_clock::time_point::max());
+            ns, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,

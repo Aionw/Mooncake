@@ -18,7 +18,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "route/object_route.h"
+#include "metadata/object_route.h"
 #include "tenant_id.h"
 #include "types.h"
 
@@ -49,26 +49,23 @@ struct PolicyContext {
     const route::WriteGuard& guard;
 };
 
-// What the core offers a policy outside any object lock.
-class StoreView {
+// What the core offers a policy, and what its background pass may ask of it,
+// outside any object lock. The policy is handed one when it is built.
+class StoreControl {
    public:
-    virtual ~StoreView() = default;
+    virtual ~StoreControl() = default;
 
-    // Runs `fn(tenant_id, attachment, route)` for every namespace. The route
-    // may be walked with a cursor; while restoring, a write cursor may also
-    // reset each key's policy words.
+    // Runs `fn(tenant_id, route)` for every namespace. The route may be walked
+    // with a cursor; while restoring, a write cursor may also reset each key's
+    // policy words.
     virtual void VisitNamespaces(
-        const std::function<void(const TenantId&, PolicyAttachment*,
-                                 route::ObjectRoute&)>& fn) = 0;
+        const std::function<void(const TenantId&, route::ObjectRoute&)>&
+            fn) = 0;
     // Objects the namespace holds right now; zero when it does not exist.
     virtual size_t ObjectCount(const TenantId& tenant_id) const = 0;
     // The memory every namespace's share is carved from.
     virtual uint64_t AllocatableMemoryBytes() const = 0;
-};
 
-// What a policy's background pass may ask the core to do.
-class StoreControl : public StoreView {
-   public:
     struct EvictionResult {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
@@ -127,14 +124,14 @@ class NamespacePolicy {
 
     // Metadata was restored (startup, snapshot load, standby promotion) and no
     // write is in flight yet.
-    virtual void OnRestored(StoreView& store) { (void)store; }
+    virtual void OnRestored() {}
 
     // The allocatable memory changed (a segment mounted or went away); runs
     // outside every core lock.
-    virtual void OnCapacityChanged(StoreView& store) { (void)store; }
+    virtual void OnCapacityChanged() {}
 
     // One round of the eviction thread, outside every core lock.
-    virtual void OnMaintenance(StoreControl& store) { (void)store; }
+    virtual void OnMaintenance() {}
 };
 
 }  // namespace mooncake

@@ -30,10 +30,13 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     dynamic_replication_controller.cpp
+    eviction/evictor.cpp
+    eviction/offloading_reclaimer.cpp
+    eviction/report_observers.cpp
     promotion_candidate_tracker.cpp
     master_service.cpp
-    tenant_quota_manager.cpp
-    tenant_quota_policy.cpp
+    tenant/quota_manager.cpp
+    tenant/quota_policy.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_snapshot_manager.cpp
@@ -51,8 +54,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
-    tenant_quota.cpp
-    tenant_quota_policy_store.cpp
+    tenant/quota.cpp
+    tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
     master_admin_service.cpp

@@ -34,8 +34,8 @@
 #include "metadata/namespace_policy.h"
 #include "object_metadata.h"
 #include "tenant_id.h"
-#include "tenant_quota.h"
-#include "tenant_quota_manager.h"
+#include "tenant/quota.h"
+#include "tenant/quota_manager.h"
 #include "types.h"
 
 namespace mooncake {
@@ -57,7 +57,7 @@ class TenantQuotaPolicy final : public NamespacePolicy {
 
     // `store` outlives the policy; the allocatable capacity every quota is
     // carved from is read from it.
-    TenantQuotaPolicy(StoreView& store, Options options);
+    TenantQuotaPolicy(StoreControl& store, Options options);
 
     // Opens the connector the policies persist to and loads them. Throws when
     // the store cannot be opened or read, or holds a policy out of range.
@@ -96,16 +96,16 @@ class TenantQuotaPolicy final : public NamespacePolicy {
     void OnReplace(const PolicyContext& ctx) override;
     void OnTearDown(const PolicyContext& ctx) override;
     void OnWriteRelease(const PolicyContext& ctx) override;
-    void OnRestored(StoreView& store) override;
-    void OnCapacityChanged(StoreView& store) override;
-    void OnMaintenance(StoreControl& store) override;
+    void OnRestored() override;
+    void OnCapacityChanged() override;
+    void OnMaintenance() override;
 
    private:
     friend class test::MasterServiceTestPeer;
 
-    static TenantQuotaAccount* AccountOf(const PolicyContext& ctx);
+    static TenantQuotaAccount& AccountOf(const PolicyContext& ctx);
 
-    StoreView& store_;
+    StoreControl& store_;
     const Options options_;
     TenantQuotaManager manager_;
     // Touched only by OnMaintenance, which the eviction thread alone calls.

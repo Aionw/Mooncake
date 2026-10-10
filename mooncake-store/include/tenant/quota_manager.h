@@ -9,9 +9,6 @@
 // keeps what its object is charged in its policy word. This class decides how
 // large every account is.
 //
-// A disabled manager meters nothing: every tenant counts as registered and no
-// account is ever handed out.
-//
 // Lock order: the policy lock, then (outside it) the master's snapshot lock and
 // a key lock, then the recompute lock, then the table's shard locks. The
 // capacity callback runs under the recompute lock and must take nothing above
@@ -28,9 +25,9 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "tenant_id.h"
-#include "tenant_quota.h"
-#include "tenant_quota_policy_store.h"
-#include "tenant_quota_sharded.h"
+#include "tenant/quota.h"
+#include "tenant/quota_policy_store.h"
+#include "tenant/quota_sharded.h"
 #include "types.h"
 
 namespace mooncake {
@@ -44,26 +41,23 @@ class TenantQuotaManager {
     // The bytes every tenant's effective quota is carved from.
     using CapacityFn = std::function<uint64_t()>;
 
-    TenantQuotaManager(bool enabled, CapacityFn allocatable_capacity);
+    explicit TenantQuotaManager(CapacityFn allocatable_capacity);
 
     TenantQuotaManager(const TenantQuotaManager&) = delete;
     TenantQuotaManager& operator=(const TenantQuotaManager&) = delete;
 
-    bool Enabled() const { return enabled_; }
-
     // Opens the connector the policies persist to. Throws
-    // std::invalid_argument when it cannot be opened; a no-op when disabled.
+    // std::invalid_argument when it cannot be opened.
     void OpenPolicyStore(const std::string& type, const std::string& uri,
                          const std::string& cluster_id);
     // Replaces the table's policies with the persisted ones. Throws when the
     // store cannot be read or holds a policy out of range.
     void LoadPoliciesOrThrow();
 
-    // The stable account of one tenant, created closed on first use. Only for
-    // binding a metered tenant; a disabled manager hands out none.
+    // The stable account of one tenant, created closed on first use.
     TenantQuotaAccount& AccountFor(const TenantId& tenant_id);
 
-    // Whether writes to the tenant are admitted; always true when disabled.
+    // Whether writes to the tenant are admitted.
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     // Held across a tenant's admission check and the write it admits, so a
     // concurrent policy delete cannot land in between.
@@ -97,7 +91,6 @@ class TenantQuotaManager {
     // Throws when a policy is out of the accounting range.
     void ApplyPolicies(const TenantQuotaPolicySnapshot& snapshot);
 
-    const bool enabled_;
     const CapacityFn allocatable_capacity_;
     std::unique_ptr<TenantQuotaPolicyStore> policy_store_;
     mutable std::mutex policy_mutex_;

@@ -393,9 +393,9 @@ class MasterServiceTestPeer {
         const MasterServiceConfig& config);
 
     void DiscardExpiredProcessingReplicas(
-        metadata::Namespace& tenant, const TenantId& tenant_id,
+        metadata::Namespace& ns,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(tenant, tenant_id, now);
+        service_.DiscardExpiredProcessingReplicas(ns, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
