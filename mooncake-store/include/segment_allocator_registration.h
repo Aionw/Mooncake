@@ -22,6 +22,7 @@ class SegmentAllocatorRegistration {
     SegmentAllocatorRegistration(std::shared_ptr<BufferAllocatorBase> allocator,
                                  ClientSessionSharedPtr owner_session);
 
+    [[nodiscard]] SegmentLifetime SnapshotLifetime() const;
     void BindAllocator(std::shared_ptr<BufferAllocatorBase> replacement);
     void BindClientSession(ClientSessionSharedPtr record);
     void BindBuffer(AllocatedBuffer& buffer) const;
@@ -32,7 +33,9 @@ class SegmentAllocatorRegistration {
     // A registration property, not part of the incarnation state that buffers
     // carry: it survives a session rebind and no buffer ever reads it.
     std::atomic<bool> allocatable_{true};
-    SegmentLifetime lifetime_;
+    // Only registrations publish replacement generations. Buffers retain a
+    // plain shared_ptr snapshot and never load this atomic on read paths.
+    AtomicSharedPtr<SegmentLifetime::State> lifetime_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;

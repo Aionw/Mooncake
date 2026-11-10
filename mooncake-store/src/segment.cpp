@@ -165,10 +165,26 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
 }
 
 ErrorCode ScopedSegmentAccess::MountSegment(
-    const Segment& segment, const UUID& client_id,
-    ClientSessionSharedPtr owner_session) {
+    const Segment& segment, ClientSessionSharedPtr owner_session) {
+    if (!owner_session) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const UUID client_id = owner_session->ClientId();
+    for (const auto& [id, mounted] : segment_manager_->mounted_segments_) {
+        if (mounted.remount_in_progress &&
+            (id == segment.id || mounted.segment.name == segment.name ||
+             mounted.segment.te_endpoint == segment.te_endpoint ||
+             mounted.segment.name == segment.te_endpoint ||
+             mounted.segment.te_endpoint == segment.name)) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
     if (segment.locality && segment.locality->numa_node < 0) {
         return ErrorCode::INVALID_PARAMS;
+    }
+    if (segment_manager_->pending_unmount_names_.contains(segment.name) &&
+        !segment_manager_->mounted_segments_.contains(segment.id)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     const auto indexed_name =
         segment_manager_->segment_id_by_name_.find(segment.name);
@@ -176,9 +192,9 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         const auto indexed_segment =
             segment_manager_->mounted_segments_.find(indexed_name->second);
         if (indexed_segment == segment_manager_->mounted_segments_.end()) {
-            // Offboarding retains this name until its durable unmount record
-            // has been accepted. Live same-name Segments remain supported.
-            return ErrorCode::INVALID_PARAMS;
+            // Background cleanup retains this name until its cleanup and
+            // unmount records are accepted. A later mount can retry.
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
         if (indexed_segment->second.status == SegmentStatus::UNMOUNTING) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
@@ -284,9 +300,10 @@ ErrorCode ScopedSegmentAccess::MountSegment(
 }
 
 void ScopedSegmentAccess::BindClientSession(
-    const UUID& client_id, const ClientSessionSharedPtr& owner_session) {
+    const ClientSessionSharedPtr& owner_session) {
+    CHECK(owner_session);
     const auto client_segments_it =
-        segment_manager_->client_segments_.find(client_id);
+        segment_manager_->client_segments_.find(owner_session->ClientId());
     if (client_segments_it != segment_manager_->client_segments_.end()) {
         for (const auto& segment_id : client_segments_it->second) {
             auto mounted_it =
@@ -306,6 +323,15 @@ void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
         .allocator_registration->BindBuffer(buffer);
 }
 
+void ScopedSegmentAccess::SetRemountInProgress(const UUID& segment_id,
+                                               bool in_progress) {
+    auto& mounted = segment_manager_->mounted_segments_.at(segment_id);
+    CHECK(mounted.status == SegmentStatus::OK &&
+          mounted.allocator_registration);
+    mounted.remount_in_progress = in_progress;
+    mounted.allocator_registration->SetAllocatable(!in_progress);
+}
+
 bool ScopedSegmentAccess::RebindBufferToOwningSegment(AllocatedBuffer& buffer) {
     for (auto& [segment_id, mounted] : segment_manager_->mounted_segments_) {
         (void)segment_id;
@@ -319,14 +345,18 @@ bool ScopedSegmentAccess::RebindBufferToOwningSegment(AllocatedBuffer& buffer) {
 }
 
 ErrorCode ScopedSegmentAccess::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id,
+    const std::vector<Segment>& segments,
     ClientSessionSharedPtr owner_session) {
+    if (!owner_session) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     for (const auto& segment : segments) {
-        auto validation = ValidateRemountSegment(segment, client_id);
+        auto validation =
+            ValidateRemountSegment(segment, owner_session->ClientId());
         if (validation != ErrorCode::OK) {
             return validation;
         }
-        ErrorCode err = MountSegment(segment, client_id, owner_session);
+        ErrorCode err = MountSegment(segment, owner_session);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
             LOG(ERROR) << "segment_name=" << segment.name
@@ -357,6 +387,9 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
     auto mounted = segment_manager_->mounted_segments_.find(segment.id);
     if (mounted == segment_manager_->mounted_segments_.end()) {
         return ErrorCode::OK;
+    }
+    if (mounted->second.remount_in_progress) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     const auto owner = segment_manager_->client_segments_.find(client_id);
     const bool owned = owner != segment_manager_->client_segments_.end() &&
@@ -440,9 +473,10 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
                      << ", warn=segment_not_found";
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    if (it->second.status == SegmentStatus::UNMOUNTING) {
-        // A concurrent unmount already owns preparation. Offboarding retries
-        // this expected state without taking over the first caller's
+    if (it->second.remount_in_progress ||
+        it->second.status == SegmentStatus::UNMOUNTING) {
+        // A concurrent remount or unmount already owns preparation. Offboarding
+        // retries this expected state without taking over the first caller's
         // accounting.
         VLOG(1) << "segment_id=" << segment_id
                 << ", error=segment_is_unmounting";
@@ -487,7 +521,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     auto status = it->second.status;
-    if (status == SegmentStatus::UNMOUNTING) {
+    if (it->second.remount_in_progress || status == SegmentStatus::UNMOUNTING) {
         LOG(ERROR) << "segment_id=" << segment_id
                    << ", error=segment_is_unmounting";
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
@@ -592,7 +626,10 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     const bool is_cxl = mounted->second.segment.protocol == "cxl";
     RemoveHostSegment(segment_manager_->segments_by_host_,
                       mounted->second.segment);
-    if (!retain_name_registration) {
+    if (retain_name_registration) {
+        segment_manager_->pending_unmount_names_[segment_name].insert(
+            segment_id);
+    } else {
         ReindexSegmentNameAfterRemoval(segment_id, segment_name);
     }
     // Remove from mounted_segments_
@@ -613,7 +650,18 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
 
 void ScopedSegmentAccess::ReleaseUnmountedSegmentName(
     const UUID& segment_id, const std::string& segment_name) {
-    ReindexSegmentNameAfterRemoval(segment_id, segment_name);
+    auto pending = segment_manager_->pending_unmount_names_.find(segment_name);
+    if (pending == segment_manager_->pending_unmount_names_.end() ||
+        pending->second.erase(segment_id) == 0 || !pending->second.empty()) {
+        return;
+    }
+    segment_manager_->pending_unmount_names_.erase(pending);
+    auto indexed = segment_manager_->segment_id_by_name_.find(segment_name);
+    if (indexed != segment_manager_->segment_id_by_name_.end() &&
+        !segment_manager_->mounted_segments_.contains(indexed->second)) {
+        const UUID retired_id = indexed->second;
+        ReindexSegmentNameAfterRemoval(retired_id, segment_name);
+    }
 }
 
 ErrorCode ScopedSegmentAccess::GetClientSegments(
@@ -802,7 +850,8 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     }
 
     auto& mounted_segment = mounted_segment_it->second;
-    if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
+    if (mounted_segment.remount_in_progress ||
+        mounted_segment.status == SegmentStatus::UNMOUNTING) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     if (mounted_segment.status == status) {

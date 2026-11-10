@@ -12,7 +12,6 @@
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "client_liveness.h"
-#include "common/atomic_shared_ptr.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
@@ -56,10 +55,10 @@ class SegmentAllocatorRegistration;
 class SegmentLifetime {
    public:
     explicit SegmentLifetime(ClientSessionSharedPtr session = nullptr);
-    SegmentLifetime(const SegmentLifetime& other) noexcept;
-    SegmentLifetime& operator=(const SegmentLifetime& other) noexcept;
 
-    [[nodiscard]] bool isAvailable() const;
+    // Resource validity is independent of whether the owner currently serves.
+    // SUSPECTED sessions retain valid resources for recovery.
+    [[nodiscard]] bool isValid() const;
     [[nodiscard]] bool isServing() const;
     [[nodiscard]] bool operator==(const SegmentLifetime& other) const;
 
@@ -67,13 +66,14 @@ class SegmentLifetime {
     friend class AllocatedBuffer;
     friend class SegmentAllocatorRegistration;
     [[nodiscard]] ClientSessionSharedPtr getClientSession() const;
-    // Mutations are serialized by the segment lock. Readers, including copies
-    // held by detached allocator snapshots, may run concurrently.
+    // Only a registration's local snapshot is rebound under the segment lock.
+    // Published buffers keep their State; invalidation and the one-time owner
+    // binding after restore are safe to observe concurrently.
     void BindSession(ClientSessionSharedPtr session);
     void Invalidate();
     struct State;
-    std::shared_ptr<State> Snapshot() const;
-    AtomicSharedPtr<State> state_;
+    explicit SegmentLifetime(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
 };
 
 class AllocatedBuffer {
@@ -105,7 +105,7 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired() && segment_lifetime_.isAvailable();
+        return !allocator_.expired() && segment_lifetime_.isValid();
     }
 
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
@@ -116,6 +116,8 @@ class AllocatedBuffer {
         return !allocator_.expired() && segment_lifetime_.isServing();
     }
 
+    // Bind before publication, or while excluding readers of this buffer.
+    // Later session changes update the registration, not this fixed snapshot.
     void bindSegmentLifetime(SegmentLifetime lifetime) {
         segment_lifetime_ = std::move(lifetime);
     }
@@ -156,7 +158,8 @@ class AllocatedBuffer {
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    // SegmentLifetime synchronizes session rebinding with concurrent readers.
+    // A fixed generation; its validity and initial owner publication are
+    // atomic.
     SegmentLifetime segment_lifetime_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};

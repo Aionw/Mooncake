@@ -9,9 +9,27 @@ namespace {
 
 using namespace std::chrono_literals;
 
+TEST(ClientLivenessRecordTest, ClientIdSurvivesLivenessTransitions) {
+    const UUID client_id{1, 2};
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(client_id, initial);
+    EXPECT_EQ(record.ClientId(), client_id);
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(record.ClientId(), client_id);
+    ASSERT_EQ(record.Observe(initial + 11s),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_EQ(record.ClientId(), client_id);
+    ASSERT_EQ(record.Evaluate(initial + 21s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record.Evaluate(initial + 41s, 10s, 20s),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_EQ(record.ClientId(), client_id);
+}
+
 TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
 
     EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -24,7 +42,7 @@ TEST(ClientLivenessRecordTest, SuspicionWindowStartsAtActualTransition) {
 
 TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
 
     ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -43,7 +61,7 @@ TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
 
 TEST(ClientLivenessRecordTest, EveryStateChangeIsReportedToItsCaller) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
     using Observation = ClientLivenessObservation;
     using Transition = ClientLivenessTransition;
     // The return value is the only notification there is, so it must tell a
@@ -65,7 +83,7 @@ TEST(ClientLivenessRecordTest, EveryStateChangeIsReportedToItsCaller) {
 
 TEST(ClientLivenessRecordTest, DelayedObservationCannotMoveHeartbeatBackwards) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
+    ClientLivenessRecord record(UUID{1, 2}, initial);
     (void)record.Observe(initial + 20s);
     (void)record.Observe(initial + 1s);
     EXPECT_EQ(record.Evaluate(initial + 29s, 10s, 20s),

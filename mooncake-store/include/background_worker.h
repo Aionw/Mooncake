@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -49,11 +50,18 @@ class BackgroundWorker {
         }
     }
 
-    void Schedule() {
+    void Schedule() { ScheduleAfter(std::chrono::milliseconds::zero()); }
+
+    // A retry does not busy-loop, delay a fresh request, or prevent Stop().
+    void ScheduleAfter(std::chrono::milliseconds delay) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!running_) {
                 return;
+            }
+            const auto due = std::chrono::steady_clock::now() + delay;
+            if (!requested_ || due < next_run_) {
+                next_run_ = due;
             }
             requested_ = true;
         }
@@ -69,6 +77,13 @@ class BackgroundWorker {
                 if (!running_) {
                     return;
                 }
+                if (std::chrono::steady_clock::now() < next_run_) {
+                    const auto due = next_run_;
+                    cv_.wait_until(lock, due, [this, due] {
+                        return !running_ || next_run_ < due;
+                    });
+                    continue;
+                }
                 requested_ = false;
             }
             callback_();
@@ -81,6 +96,7 @@ class BackgroundWorker {
     std::thread thread_;
     bool running_{false};
     bool requested_{false};
+    std::chrono::steady_clock::time_point next_run_{};
 };
 
 }  // namespace mooncake

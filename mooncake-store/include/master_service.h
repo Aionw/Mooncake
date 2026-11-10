@@ -218,6 +218,10 @@ class MasterService {
 
     /**
      * @brief Unmount a memory segment. This function is idempotent.
+     * Ordinary memory is invalidated before returning; metadata cleanup runs
+     * in the background in both HA and non-HA modes. With an OpLog, reusing
+     * the name may temporarily return UNAVAILABLE_IN_CURRENT_STATUS until
+     * cleanup and unmount records are accepted. CXL keeps synchronous cleanup.
      * @return ErrorCode::OK on success,
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
@@ -1164,7 +1168,7 @@ class MasterService {
 
     void ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandlesLocked();
+    tl::expected<void, ErrorCode> ClearInvalidHandlesLocked();
     // Clear completed LOCAL_DISK replicas owned by exactly this client during
     // explicit unmount, even if its session still retains resources.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
@@ -1554,6 +1558,15 @@ class MasterService {
 
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
+    struct PendingSegmentUnmount {
+        UUID segment_id;
+        std::string segment_name;
+        std::string transport_endpoint;
+    };
+    // The segment is already invalidated and removed. Keep its name reserved
+    // until the cleanup records and then SEGMENT_UNMOUNT enter the OpLog.
+    std::mutex pending_segment_unmounts_mutex_;
+    std::vector<PendingSegmentUnmount> pending_segment_unmounts_;
     BackgroundWorker replica_cleanup_worker_;
     BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
@@ -1893,10 +1906,7 @@ class MasterService {
     // Client session plane, declared in dependency order so the registry is
     // destroyed before the offboarding worker its listener feeds. Resource
     // coordination is a session listener, not a session responsibility.
-    ClientOffboardingWorker client_offboarding_worker_{
-        [this](ClientOffboardingJob& job) {
-            return ProcessClientOffboardingJob(job);
-        }};
+    ClientOffboardingWorker client_offboarding_worker_;
     ClientSessionRegistry client_sessions_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
@@ -2321,6 +2331,44 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    struct RestoredReplicaReference {
+        TenantId tenant_id;
+        route::ObjectRef object;
+        ReplicaID replica_id;
+    };
+    // Built before a restored master serves requests. A remount visits only
+    // its restored publications; erased/replaced keys are rejected by ref/id.
+    std::unordered_map<std::string, std::vector<RestoredReplicaReference>>
+        standby_replica_index_;
+
+    struct PreparedRemountSegment {
+        Segment segment;
+        std::shared_ptr<BufferAllocatorBase> expected_allocator;
+        std::shared_ptr<BufferAllocatorBase> orphan_allocator;
+        std::shared_ptr<BufferAllocatorBase> restored_allocator;
+        std::vector<RestoredReplicaReference> replicas;
+        std::vector<AllocatedBuffer::Descriptor> descriptors;
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    };
+    struct PreparedRemount {
+        std::vector<PreparedRemountSegment> segments;
+        bool concurrent_preparation;
+        // Reclaim the potentially large index outside the global lock.
+        std::vector<std::vector<RestoredReplicaReference>> retired_indexes;
+        // Set only through the test peer to exercise a commit-batch gap.
+        std::function<void()> after_batch_for_testing;
+    };
+    // The caller retains the session registration through both phases. That
+    // also excludes another restore, without holding the global state lock.
+    bool CanPrepareRemountConcurrently(const std::vector<Segment>& segments);
+    tl::expected<PreparedRemount, ErrorCode> PrepareRemount(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        bool concurrent_preparation);
+    tl::expected<void, ErrorCode> CommitRemount(
+        PreparedRemount& preparation, const UUID& client_id,
+        const ClientSessionSharedPtr& owner_session,
+        std::unique_lock<std::shared_mutex>& state_lock);
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

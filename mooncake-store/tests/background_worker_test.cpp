@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 
 #include <gtest/gtest.h>
@@ -63,6 +64,49 @@ TEST(BackgroundWorkerTest, ScheduleIsIgnoredWhileStopped) {
 
     std::lock_guard<std::mutex> lock(mutex);
     EXPECT_EQ(callback_count, 0);
+}
+
+TEST(BackgroundWorkerTest, ImmediateRequestPreemptsDelayedRetry) {
+    std::promise<void> called;
+    auto done = called.get_future();
+    BackgroundWorker worker([&] { called.set_value(); });
+    worker.Start();
+    worker.ScheduleAfter(std::chrono::hours(1));
+    worker.Schedule();
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    worker.Stop();
+}
+
+TEST(BackgroundWorkerTest, StopCancelsDelayedRetry) {
+    BackgroundWorker worker([] { ADD_FAILURE() << "Cancelled retry ran"; });
+    worker.Start();
+    worker.ScheduleAfter(std::chrono::hours(1));
+    const auto start = std::chrono::steady_clock::now();
+    worker.Stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+}
+
+TEST(BackgroundWorkerTest, CallbackCanScheduleItsOwnRetry) {
+    std::promise<void> called;
+    auto done = called.get_future();
+    size_t attempts = 0;
+    BackgroundWorker* self = nullptr;
+    BackgroundWorker worker([&] {
+        if (++attempts == 1) {
+            self->ScheduleAfter(std::chrono::milliseconds(20));
+        } else {
+            called.set_value();
+        }
+    });
+    self = &worker;
+    worker.Start();
+    worker.Schedule();
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    worker.Stop();
+    EXPECT_EQ(attempts, 2u);
 }
 
 }  // namespace mooncake::test

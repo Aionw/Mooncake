@@ -219,7 +219,8 @@ ClientSessionRegistry::Registration::Registration(
         provisional_ = !slot_;
         if (provisional_) {
             slot_ = std::make_shared<ClientSlot>(
-                std::make_shared<ClientLivenessRecord>(observed_at_));
+                std::make_shared<ClientLivenessRecord>(client_id,
+                                                       observed_at_));
             // Claim the private slot before publication; never acquire a
             // published slot's operation lock under the registry lock.
             operation_ = ExclusiveOperation(slot_->operation_mutex);
@@ -302,7 +303,8 @@ ClientSessionSharedPtr ClientSessionRegistry::RestoreBatch::FindOrCreate(
     if (const auto it = pending_.find(client_id); it != pending_.end()) {
         return it->second;
     }
-    auto record = std::make_shared<ClientLivenessRecord>(Clock::now());
+    auto record =
+        std::make_shared<ClientLivenessRecord>(client_id, Clock::now());
     pending_.emplace(client_id, record);
     return record;
 }
@@ -356,6 +358,7 @@ ClientSessionRegistry::Slots ClientSessionRegistry::SnapshotSlots() const {
 void ClientSessionRegistry::AdoptSlot(const UUID& client_id, const Slot& slot) {
     CHECK(slot && slot->liveness);
     CHECK(slot->liveness->IsServing());
+    CHECK(slot->liveness->ClientId() == client_id);
     CHECK(!slots_.contains(client_id));
     slots_.emplace(client_id, slot);
     MasterMetricManager::instance().client_liveness_record_created();

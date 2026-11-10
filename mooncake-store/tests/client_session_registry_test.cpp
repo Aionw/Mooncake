@@ -185,6 +185,7 @@ TEST_F(ClientSessionRegistryTest, SessionScopesExposeOnlyReadOnlyIdentity) {
     auto guard = registry.TryAcquireServingSession(kClient);
     ASSERT_TRUE(guard);
     EXPECT_EQ(guard->Session(), record);
+    EXPECT_EQ(guard->Session()->ClientId(), kClient);
     EXPECT_TRUE(guard->Session()->IsServing());
 }
 
@@ -633,6 +634,7 @@ TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
         auto restore = registry.BeginRestore();
         EXPECT_EQ(restore.FindOrCreate(kClient), existing);
         auto pending = restore.FindOrCreate(other);
+        EXPECT_EQ(pending->ClientId(), other);
         EXPECT_EQ(restore.FindOrCreate(other), pending);
     }
     EXPECT_FALSE(Find(registry, other));
@@ -642,7 +644,9 @@ TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
         restore.Commit();
     }
     EXPECT_EQ(Find(registry, kClient), existing);
-    EXPECT_TRUE(Find(registry, other));
+    const auto restored = Find(registry, other);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->ClientId(), other);
     Drain(registry);
     EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.Ping(other), ClientStatus::NEED_REMOUNT);

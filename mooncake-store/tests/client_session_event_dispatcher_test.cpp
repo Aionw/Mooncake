@@ -17,7 +17,7 @@ const UUID kClient{1, 2};
 ClientSessionEvent Transition(State previous, State current) {
     return {kClient,
             std::make_shared<const ClientLivenessRecord>(
-                ClientLivenessRecord::TimePoint{}),
+                kClient, ClientLivenessRecord::TimePoint{}),
             previous, current};
 }
 

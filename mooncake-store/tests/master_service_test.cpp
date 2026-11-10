@@ -2687,11 +2687,11 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsEveryTenant) {
     EXPECT_TRUE(service->GetReplicaList("mixed_key", tenant_b).has_value());
 }
 
-TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
+TEST_F(MasterServiceTest, UnmountSegmentUsesAsyncCleanupInHaMode) {
     auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
     auto service = std::make_unique<MasterService>(config);
 
-    auto segment = MakeSegment("ha_sync_segment");
+    auto segment = MakeSegment("ha_async_segment");
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
     const auto key = GenerateKeyForSegment(client_id, service, segment.name);
@@ -2699,7 +2699,18 @@ TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
 
+    PauseReplicaCleanup(*service);
     ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
+    EXPECT_EQ(1u, service->GetKeyCount());
+    EXPECT_FALSE(service->GetReplicaList(key, TenantId::Default()).has_value());
+    exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(*exists);
+
+    ResumeReplicaCleanup(*service);
+    for (size_t i = 0; i < 100 && service->GetKeyCount() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     EXPECT_EQ(0u, service->GetKeyCount());
 }
 

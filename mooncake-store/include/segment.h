@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -29,6 +30,7 @@ struct MountedSegment {
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
     std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
+    bool remount_in_progress{false};
 };
 
 struct MountedNoFSegment {
@@ -79,9 +81,9 @@ class ScopedSegmentAccess {
         : segment_manager_(segment_manager), lock_(mutex) {}
 
     /**
-     * @brief Mount a segment
+     * @brief Mount a segment under its non-null owner's client ID.
      */
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id,
+    ErrorCode MountSegment(const Segment& segment,
                            ClientSessionSharedPtr owner_session);
 
     /**
@@ -91,7 +93,6 @@ class ScopedSegmentAccess {
      * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id,
                              ClientSessionSharedPtr owner_session);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
@@ -143,9 +144,11 @@ class ScopedSegmentAccess {
      * @brief Bind restored segment resources to their owner session.
      *        Segment snapshots intentionally do not persist session state.
      */
-    void BindClientSession(const UUID& client_id,
-                           const ClientSessionSharedPtr& owner_session);
+    void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    // A newly mounted allocator remains closed until all restored replicas
+    // have been rebound. Control operations retry rather than retiring it.
+    void SetRemountInProgress(const UUID& segment_id, bool in_progress);
     [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
@@ -423,6 +426,9 @@ class SegmentManager {
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
         segment_id_by_name_;             // segment name -> segment_id
+    // Every retired range must enqueue its unmount before the name is reused.
+    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
+        pending_unmount_names_;
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;

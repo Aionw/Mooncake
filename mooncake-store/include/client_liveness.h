@@ -7,6 +7,8 @@
 #include <mutex>
 #include <string_view>
 
+#include "types.h"
+
 namespace mooncake {
 
 enum class ClientLivenessState {
@@ -51,8 +53,10 @@ class ClientLivenessRecord {
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
-    explicit ClientLivenessRecord(TimePoint initial_observation)
-        : last_liveness_at_(initial_observation) {}
+    ClientLivenessRecord(const UUID& client_id, TimePoint initial_observation)
+        : client_id_(client_id), last_liveness_at_(initial_observation) {}
+
+    [[nodiscard]] const UUID& ClientId() const { return client_id_; }
 
     [[nodiscard]] ClientLivenessState state() const {
         return state_.load(std::memory_order_acquire);
@@ -111,15 +115,16 @@ class ClientLivenessRecord {
     }
 
    private:
+    const UUID client_id_;
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };
 
-// Read-only, shared identity of one client registration. Resources retain this
-// handle; mutable liveness records and operation admission belong to the
-// registry.
+// Read-only, shared identity of one client registration, including its stable
+// client ID. The shared identity distinguishes incarnations with the same ID.
+// Resources retain this handle; mutation and admission belong to the registry.
 using ClientSessionSharedPtr = std::shared_ptr<const ClientLivenessRecord>;
 
 }  // namespace mooncake
